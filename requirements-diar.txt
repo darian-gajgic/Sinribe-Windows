@@ -1,0 +1,28 @@
+# Sinribe (Windows) — speaker-separation environment (.venv-diar). Python 3.12, win_amd64.
+#
+# torch is NOT listed here. It is installed first, from a PyTorch index chosen from the GPU in
+# the machine (sinribe/winenv.py:torch_target), as one version-locked set:
+#
+#   uv pip install --python .venv-diar\Scripts\python.exe \
+#       --index-url https://download.pytorch.org/whl/cu130 \
+#       torch==2.13.0 torchaudio==2.11.0 torchcodec==0.15.0
+#   uv pip install --python .venv-diar\Scripts\python.exe -r requirements-diar.txt
+#
+# By the time this file is installed torch already satisfies pyannote's requirement, so the
+# resolver leaves the CUDA build alone instead of replacing it with the CPU wheel PyPI serves
+# for Windows.
+#
+# Why a second environment at all: ctranslate2 in .venv is a CUDA 12 binary and torch here is
+# usually a CUDA 13 one — they cannot share a process. The split also means the diarization
+# process *exits* between stages, which is the only reliable way to give a GPU's memory back
+# (deleting the model in-process does not return the CUDA context).
+#
+# One non-obvious dependency: pyannote.audio 4 imports torchcodec unconditionally, and
+# torchcodec loads FFmpeg's avcodec/avformat/avutil DLLs at import time. That is why setup
+# downloads the *shared* FFmpeg build and the diarization worker registers its bin directory
+# before importing pyannote. Sinribe never decodes with torchcodec — the worker is handed an
+# already-decoded waveform — but the import still has to succeed.
+
+pyannote.audio==4.0.7
+soundfile==0.14.0
+numpy

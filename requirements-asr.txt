@@ -1,0 +1,27 @@
+# Sinribe (Windows) — transcription + interface environment (.venv). Python 3.12, win_amd64.
+#
+# Installed by the setup wizard; the equivalent by hand is:
+#   tools\uv.exe venv --python 3.12 .venv
+#   tools\uv.exe pip install --python .venv\Scripts\python.exe -r requirements-asr.txt
+#
+# The pins are the ones proven on the Linux original, minus its CUDA lines, which live in
+# requirements-cuda.txt so a machine with no NVIDIA GPU does not download 1.3 GB it cannot use.
+# Every version here has a cp312/abi3 win_amd64 wheel — checked, not assumed. Python 3.12 is
+# the ceiling for that claim: 3.13+ loses a wheel for one of these depending on the week.
+
+faster-whisper==1.2.1
+ctranslate2==4.8.0
+av==18.0.0
+onnxruntime==1.27.0
+numpy==2.5.0
+huggingface-hub==1.21.0
+tokenizers==0.23.1
+
+# Interface (abi3 wheel, works on any Python >= 3.10).
+PySide6==6.11.1
+
+# Download audio from a pasted link (YouTube podcasts etc). Deliberately UNPINNED: sites change
+# their delivery constantly and a pinned yt-dlp silently rots. If a link stops working, the first
+# thing to try is:
+#   tools\uv.exe pip install --python .venv\Scripts\python.exe -U yt-dlp
+yt-dlp

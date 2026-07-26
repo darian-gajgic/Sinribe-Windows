@@ -1,0 +1,16 @@
+# Sinribe (Windows) — CUDA 12 runtime for the transcription environment (.venv).
+#
+# Installed only when an NVIDIA GPU is present. About 1.3 GB, which is exactly why it is a
+# separate file: a CPU-only machine must not download it.
+#
+# ctranslate2 4.8.0 is a CUDA 12 binary and needs cublas64_12.dll plus the cuDNN 9 DLLs. It does
+# not find them on its own, and on Windows no environment variable can help — since Python 3.8,
+# an extension module's dependent DLLs are resolved from System32 and directories registered
+# with os.add_dll_directory(), never from PATH. sinribe/winenv.py:enable_cuda_dlls() registers
+# the three directories below, and the ASR worker calls it before importing faster_whisper.
+#
+# These exact versions are the ones running in production on the Linux build.
+
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.24.0.43
+nvidia-cuda-nvrtc-cu12==12.9.86
