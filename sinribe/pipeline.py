@@ -305,6 +305,11 @@ class Runner:
 
         t = threading.Thread(target=drain, daemon=True)
         t.start()
+        # A worker that fails emits an `error` event and *then* exits non-zero. The rc check below
+        # runs inside this generator, i.e. before the caller's loop body ever sees the last event,
+        # so the diagnosis has to be captured here — otherwise it is replaced by a bare "exited
+        # with code 1" and the caller's `kind` dispatch (the ASR OOM tier ladder) never fires.
+        last_err: dict | None = None
         try:
             assert proc.stdin is not None and proc.stdout is not None
             proc.stdin.write(json.dumps(job) + "\n")
@@ -318,9 +323,13 @@ class Runner:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    ev = json.loads(line)
                 except json.JSONDecodeError:
                     self._on_log(line)  # stray stdout print from a library
+                    continue
+                if isinstance(ev, dict) and ev.get("ev") == "error":
+                    last_err = ev
+                yield ev
             rc = proc.wait(timeout=120)
             # cancel() kills the child from another thread, which simply closes stdout and ends
             # the loop above without an exception. Without this check the stage would return its
@@ -329,6 +338,9 @@ class Runner:
             if self._cancel.is_set():
                 raise Cancelled("cancelled by user")
             if rc != 0:
+                if last_err:
+                    raise StageError(str(last_err.get("msg") or f"{module} exited with code {rc}"),
+                                     kind=str(last_err.get("kind") or "runtime"))
                 raise StageError(f"{module} exited with code {rc}")
         finally:
             t.join(timeout=2)

@@ -22,6 +22,9 @@ import time
 
 _OOM_MARKERS = ("out of memory", "cuda error", "cublas_status_alloc_failed")
 
+# The only diarization pipeline setup downloads into the offline model cache.
+DEFAULT_PIPELINE = "pyannote/speaker-diarization-community-1"
+
 
 def emit(**kw) -> None:
     sys.stdout.write(json.dumps(kw, ensure_ascii=False) + "\n")
@@ -90,7 +93,7 @@ def main() -> int:
     job = json.loads(raw)
 
     wav = job["wav"]
-    pipeline_name = job.get("pipeline", "pyannote/speaker-diarization-community-1")
+    pipeline_name = job.get("pipeline") or DEFAULT_PIPELINE
     token = job.get("hf_token") or None
     device_pref = job.get("device", "cuda")
 
@@ -136,6 +139,18 @@ def main() -> int:
     try:
         pipeline = Pipeline.from_pretrained(pipeline_name, token=token)
     except Exception as e:  # noqa: BLE001
+        # We run with HF_HUB_OFFLINE=1, so a pipeline that was never downloaded — or one whose
+        # gated conditions were never accepted, which is why it was never downloaded — surfaces
+        # as a cache miss rather than as a 403. Say which of those it is instead of leaving a
+        # message about an internet connection this app deliberately does not use.
+        if "LocalEntryNotFound" in type(e).__name__ or "cannot find the requested files" in str(e):
+            emit(ev="error", kind="load",
+                 msg=f"{pipeline_name} is not in the local model cache, and Sinribe runs fully "
+                     f"offline. Choose {DEFAULT_PIPELINE} under Diarizer — that is the pipeline "
+                     f"setup downloads. (A different pipeline, such as "
+                     f"pyannote/speaker-diarization-3.1, also needs its conditions accepted on "
+                     f"huggingface.co with this token's account before it can be fetched.)")
+            return 1
         emit(ev="error", kind="load",
              msg=f"could not load {pipeline_name}: {type(e).__name__}: {e}")
         return 1
