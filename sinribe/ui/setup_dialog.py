@@ -19,7 +19,9 @@ from PySide6.QtWidgets import (
 )
 
 from .. import setup_core, winenv
-from ..config import WHISPER_MODELS, hf_token, load_config, save_config
+from ..config import (
+    LOCAL_MODELS, WHISPER_MODELS, hf_token, load_config, model_available, save_config,
+)
 
 TOKEN_HELP = (
     "Speaker names come from pyannote, whose model is free but gated. One-time setup:\n"
@@ -158,7 +160,7 @@ class SetupDialog(QDialog):
         self.model_cb = QComboBox()
         for name, _repo, gb, note in WHISPER_MODELS:
             self.model_cb.addItem(f"{name} — {gb:.1f} GB · {note}", name)
-        want = str(self.cfg.get("asr_model", "large-v3"))
+        want = setup_core.downloadable_model(self.cfg)
         # A CPU-only machine defaulting to large-v3 is a trap: it works, at roughly half
         # realtime, so a one-hour recording takes two hours. Suggest something usable instead.
         if not winenv.cuda_supported(self._gpu) and want == "large-v3":
@@ -183,19 +185,31 @@ class SetupDialog(QDialog):
         self.diar_cb.stateChanged.connect(self._refresh)
         g.addWidget(self.diar_cb, 3, 0, 1, 3)
 
+        self.german_cb = QCheckBox("Add the German speech models (optional, ~5 GB)")
+        self.german_cb.setChecked(
+            all(model_available(n) for n in LOCAL_MODELS))
+        self.german_cb.setToolTip(
+            "Whisper fine-tuned on German alone. Downloaded and converted here, once, which "
+            "takes a few minutes of processor time.\n\n"
+            "Not automatically better: on a hard far-field German interview plain large-v3 "
+            "still measured more accurate. They are what the fastest quality setting runs, and "
+            "the middle settings vote one of them against large-v3.")
+        self.german_cb.stateChanged.connect(self._refresh)
+        g.addWidget(self.german_cb, 4, 0, 1, 3)
+
         self.token_help = QLabel(TOKEN_HELP)
         self.token_help.setObjectName("Subtle")
         self.token_help.setWordWrap(True)
-        g.addWidget(self.token_help, 4, 0, 1, 3)
+        g.addWidget(self.token_help, 5, 0, 1, 3)
 
-        g.addWidget(QLabel("HF token"), 5, 0)
+        g.addWidget(QLabel("HF token"), 6, 0)
         self.token_edit = QLineEdit(hf_token() or "")
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.setPlaceholderText("hf_…")
         # editingFinished, not textChanged: a re-check walks the model cache and asks uv where
         # Python is, which is far too much work to do on every keystroke.
         self.token_edit.editingFinished.connect(self._refresh)
-        g.addWidget(self.token_edit, 5, 1, 1, 2)
+        g.addWidget(self.token_edit, 6, 1, 1, 2)
         g.setColumnStretch(1, 1)
         return card
 
@@ -225,6 +239,7 @@ class SetupDialog(QDialog):
             diarize=self.diar_cb.isChecked(),
             hf_token=self.token_edit.text().strip(),
             shortcuts=True,
+            german_models=self.german_cb.isChecked(),
         )
 
     def _refresh(self) -> None:
@@ -285,7 +300,7 @@ class SetupDialog(QDialog):
 
         # Remember the choices now, so a crash mid-install does not lose them and so the app
         # runs with the same model that is about to be downloaded.
-        self.cfg["asr_model"] = opts.model
+        setup_core.remember_model(self.cfg, opts.model)
         self.cfg["diarize"] = opts.diarize
         dev = self.device_cb.currentData()
         self.cfg["asr_device"] = "cpu" if dev == "cpu" else ("cuda" if dev == "gpu" else "auto")

@@ -10,10 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from sinribe.merge import DiarTurn
 from sinribe.pipeline import (
     ASR_TIERS, JobSpec, Runner, StageError, _asr_env, _base_env, _diar_env, _job_key,
-    pick_asr_tier, purge_old_jobs,
+    pick_asr_tier, purge_old_jobs, speech_coverage,
 )
+# Safe to import from the ASR venv: the worker only pulls torch/pyannote inside main().
+from sinribe.workers.refine_worker import trusted_turns
 
 
 class TestVramTiers:
@@ -200,6 +203,33 @@ class TestWorkerErrorPropagation:
         assert [e.get("ev") for e in seen] == ["ready", "done"]
 
 
+class TestTrustedTurns:
+    """Voice prints are only as good as the turns they are built from: a turn that touches a
+    differently-labelled neighbour may carry the other person's voice, and averaging that in
+    blurs the two prints together until the comparison decides nothing."""
+
+    def test_short_turns_are_rejected(self):
+        assert trusted_turns([{"start": 0.0, "end": 1.0, "speaker": "A"}]) == []
+
+    def test_isolated_long_turn_is_accepted(self):
+        assert len(trusted_turns([{"start": 0.0, "end": 5.0, "speaker": "A"}])) == 1
+
+    def test_turn_abutting_a_different_speaker_is_rejected(self):
+        turns = [{"start": 0.0, "end": 5.0, "speaker": "A"},
+                 {"start": 5.0, "end": 10.0, "speaker": "B"}]
+        assert trusted_turns(turns) == []
+
+    def test_a_gap_from_the_other_speaker_restores_trust(self):
+        turns = [{"start": 0.0, "end": 5.0, "speaker": "A"},
+                 {"start": 6.0, "end": 11.0, "speaker": "B"}]
+        assert len(trusted_turns(turns)) == 2
+
+    def test_same_speaker_neighbour_does_not_disqualify(self):
+        turns = [{"start": 0.0, "end": 5.0, "speaker": "A"},
+                 {"start": 5.0, "end": 10.0, "speaker": "A"}]
+        assert len(trusted_turns(turns)) == 2
+
+
 class TestCheckpointShape:
     """The resume path reuses a checkpoint only when its settings match exactly."""
 
@@ -209,3 +239,170 @@ class TestCheckpointShape:
         data = json.loads(ck.read_text())
         assert data["settings"] != {"pipeline": "b"}
         assert data["settings"] == {"pipeline": "a"}
+
+    def test_every_decode_knob_reaches_the_asr_key(self):
+        """A knob passed to the worker but absent from the checkpoint key silently reuses the
+        previous decode — which during a sweep makes every variant score the same."""
+        from sinribe import presets
+        decode = presets.decode_settings({"speed_target": 6})
+        src = (Path(__file__).resolve().parent.parent
+               / "sinribe" / "pipeline.py").read_text()
+        key_block = src.split("settings = {\n", 2)[2].split("}\n", 1)[0]
+        assert "**{k: decode[k] for k in sorted(decode)}" in key_block
+        assert set(presets.BASE_DECODE) == set(decode)
+
+
+class TestDiarizerAvailability:
+    """A pipeline that was never downloaded must not be selectable.
+
+    Workers run with HF_HUB_OFFLINE=1, so picking an absent pipeline used to look fine right up
+    until the job had decoded the audio and then died several minutes in.
+    """
+
+    def _cache(self, tmp_path, monkeypatch, *present):
+        """Build a fake HuggingFace cache holding `present`, and point Sinribe at it.
+
+        HF_HOME rather than HF_HUB_CACHE: on this port every cache location resolves through
+        winenv.hf_home(), which is also what the pipeline hands its workers, so this exercises
+        the path a real job takes.
+        """
+        from sinribe import config
+        for name in present:
+            d = (tmp_path / "hub" / f"models--{name.replace('/', '--')}" / "snapshots" / "abc123")
+            d.mkdir(parents=True)
+            (d / "config.yaml").write_text("{}")
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        return config
+
+    def test_present_pipeline_is_available(self, tmp_path, monkeypatch):
+        config = self._cache(tmp_path, monkeypatch, "pyannote/speaker-diarization-community-1")
+        assert config.diar_available("pyannote/speaker-diarization-community-1")
+
+    def test_absent_pipeline_is_not(self, tmp_path, monkeypatch):
+        config = self._cache(tmp_path, monkeypatch, "pyannote/speaker-diarization-community-1")
+        assert not config.diar_available("pyannote/speaker-diarization-3.1")
+
+    def test_an_empty_snapshot_dir_does_not_count(self, tmp_path, monkeypatch):
+        # An interrupted download leaves the directory behind with nothing in it.
+        from sinribe import config
+        (tmp_path / "hub" / "models--pyannote--speaker-diarization-3.1" / "snapshots").mkdir(
+            parents=True)
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        assert not config.diar_available("pyannote/speaker-diarization-3.1")
+
+    def test_a_pipeline_needs_every_repo_it_pulls_in(self, tmp_path, monkeypatch):
+        # 3.1 loads segmentation-3.0 as well. Having only the pipeline repo is exactly the
+        # half-installed state that looks fine here and dies inside the worker.
+        config = self._cache(tmp_path, monkeypatch, "pyannote/speaker-diarization-3.1")
+        assert not config.diar_available("pyannote/speaker-diarization-3.1")
+        config = self._cache(tmp_path, monkeypatch, "pyannote/segmentation-3.0")
+        assert config.diar_available("pyannote/speaker-diarization-3.1")
+
+    def test_nothing_is_available_on_a_bare_machine(self, tmp_path, monkeypatch):
+        # The state a fresh Windows install is actually in: no models at all. Setup downloads
+        # community-1; until it has, neither pipeline may be selectable.
+        from sinribe import config
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        assert not any(config.diar_available(p) for p in config.DIAR_PIPELINES)
+
+
+class TestHotwordCompatibility:
+    """large-v3-german returns an EMPTY transcript when given hotwords. Measured, twice."""
+
+    def test_the_broken_model_is_flagged(self):
+        from sinribe.config import supports_hotwords
+        assert not supports_hotwords("large-v3-german")
+
+    def test_working_models_are_not(self):
+        from sinribe.config import supports_hotwords
+        assert supports_hotwords("large-v3")
+        assert supports_hotwords("large-v3-turbo-german")
+        assert supports_hotwords("small")
+
+
+class TestSpeechCoverage:
+    """A collapsed decode exits 0 and writes a tidy, nearly empty transcript. Catch it."""
+
+    @staticmethod
+    def _words(spans):
+        from sinribe.merge import Word
+        return [Word(start=a, end=b, word="x") for a, b in spans]
+
+    def test_full_coverage(self):
+        words = self._words([(0.0, 5.0), (5.0, 10.0)])
+        assert speech_coverage(words, [DiarTurn(0.0, 10.0, "S0")]) == 1.0
+
+    def test_collapsed_decode_is_caught(self):
+        # The real failure: 26 seconds of words against 65 minutes of diarized speech.
+        words = self._words([(0.0, 26.0)])
+        assert speech_coverage(words, [DiarTurn(0.0, 3945.0, "S0")]) < 0.05
+
+    def test_normal_gappy_transcript_passes(self):
+        # Real transcripts leave gaps between words and pauses between turns; ~80 % is healthy.
+        words = self._words([(i, i + 0.8) for i in range(100)])
+        assert speech_coverage(words, [DiarTurn(0.0, 100.0, "S0")]) > 0.7
+
+    def test_overlapping_diarization_is_not_double_counted(self):
+        words = self._words([(0.0, 10.0)])
+        turns = [DiarTurn(0.0, 10.0, "S0"), DiarTurn(0.0, 10.0, "S1")]
+        assert speech_coverage(words, turns) == 1.0
+
+    def test_overlapping_words_are_not_double_counted(self):
+        words = self._words([(0.0, 10.0), (0.0, 10.0)])
+        assert speech_coverage(words, [DiarTurn(0.0, 20.0, "S0")]) == 0.5
+
+    def test_no_diarization_makes_no_claim(self):
+        assert speech_coverage([], []) == 1.0
+
+    def test_no_words_is_zero_coverage(self):
+        assert speech_coverage([], [DiarTurn(0.0, 100.0, "S0")]) == 0.0
+
+
+class TestConfigMigration:
+    """An existing config.json predates the quality slider and must land somewhere sensible.
+
+    This port never shipped the Linux build's `asr_mode` key, so the only ambiguous value it can
+    find on disk is the old `asr_model` default.
+    """
+
+    def _load(self, tmp_path, monkeypatch, saved: dict) -> dict:
+        from sinribe import config
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(saved))
+        monkeypatch.setattr(config, "CONFIG_PATH", path)
+        return config.load_config()
+
+    def test_legacy_large_v3_does_not_pin_the_model(self, tmp_path, monkeypatch):
+        # It was the default and what setup offered first, so it records no preference — kept as
+        # a pin it would override the slider and hand an upgrading user none of the improvement.
+        cfg = self._load(tmp_path, monkeypatch, {"asr_model": "large-v3", "vad_filter": True})
+        assert cfg["asr_model"] == "auto"
+
+    def test_the_migrated_default_still_decodes_with_large_v3(self, tmp_path, monkeypatch):
+        # Flipping the pin to "auto" must not change what actually runs for someone who never
+        # touches the slider — the default rung picks large-v3 back up.
+        from sinribe import presets
+        cfg = self._load(tmp_path, monkeypatch, {"asr_model": "large-v3"})
+        assert presets.model_for(cfg) == "large-v3"
+
+    def test_deliberate_pin_survives(self, tmp_path, monkeypatch):
+        cfg = self._load(tmp_path, monkeypatch, {"asr_model": "large-v3", "speed_target": 5})
+        assert cfg["asr_model"] == "large-v3"
+        assert cfg["speed_target"] == 5
+
+    def test_other_models_are_never_touched(self, tmp_path, monkeypatch):
+        # Someone on a CPU-only machine chose "small" on purpose during setup, and it is the
+        # only model they have downloaded. Silently switching them to auto would send the next
+        # job looking for a 3 GB model that is not there.
+        cfg = self._load(tmp_path, monkeypatch, {"asr_model": "small"})
+        assert cfg["asr_model"] == "small"
+
+    def test_a_fresh_install_starts_on_auto(self, tmp_path, monkeypatch):
+        cfg = self._load(tmp_path, monkeypatch, {})
+        assert cfg["asr_model"] == "auto"
+        assert cfg["speed_target"] == 10
+
+    def test_unknown_keys_are_still_dropped(self, tmp_path, monkeypatch):
+        cfg = self._load(tmp_path, monkeypatch, {"nonsense": 1, "asr_mode": "accurate"})
+        assert "nonsense" not in cfg
+        assert "asr_mode" not in cfg

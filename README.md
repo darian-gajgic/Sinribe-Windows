@@ -44,6 +44,7 @@ Sinribe fetches its own private copy of everything it needs into its own folder.
 | CUDA runtime | ~1.3 GB | Only on machines with an NVIDIA graphics card |
 | Speech model | 0.08–3.1 GB | Your choice — see below |
 | Speaker separation | ~3.2 GB | PyTorch + pyannote. Optional |
+| German models | ~5 GB | Two German-only models. Optional, off by default |
 
 A full GPU install with the best model is around **8 GB**. Setup tells you the number before it
 starts, and can be stopped and resumed — anything already downloaded is kept.
@@ -101,14 +102,29 @@ For `interview.m4a` in your output folder:
 | `interview.sinribe.json` | Word-level data. Lets you rename speakers and re-export later |
 | `interview.srt` / `.vtt` | Subtitles |
 
+At the end of the transcript, unless you turn it off, comes a **Worth a listen** section: the
+passages the recogniser was least sure of, with timestamps and the doubtful words in bold.
+
+```markdown
+## Worth a listen
+
+- **[00:14:52]** Person 2: schon ein elementares Element. **Bei einer** Nasenatmung zum Beispiel
+- **[00:31:07]** Person 1: wenn das in eurem **Ruf steht.**
+```
+
+Fifty-seven percent of the words it flags are genuinely wrong, so on a difficult recording this is
+where an hour of checking gets you the most back — considerably more than any decode setting will.
+
 ### From the command line
 
 ```bat
 Sinribe.bat recording.m4a -o "D:\Transcripts"
 Sinribe.bat "https://www.youtube.com/watch?v=..." -o "D:\Transcripts"
 Sinribe.bat recording.mp3 --speakers 2 --language de
-Sinribe.bat --check                     :: what is installed
-Sinribe.bat --setup                     :: open setup again
+Sinribe.bat recording.mp3 -q 5                     :: slower, more accurate
+Sinribe.bat recording.mp3 --hotwords "Fujitsu, VR-Bank, Dr. Meier"
+Sinribe.bat --check                                :: what is installed
+Sinribe.bat --setup                                :: open setup again
 ```
 
 Run with arguments and it stays on the console so you can watch the progress bar. Run it with
@@ -116,12 +132,152 @@ none and it opens the window.
 
 ---
 
+## Options
+
+| Option | Default | Notes |
+|---|---|---|
+| Quality | 10× realtime ★ | The slider *is* the speed, 84× down to 1×. Each position shows its measured error rate |
+| Model | `auto` | The quality setting picks one. Override with `large-v3`, `small`, a German model… |
+| Names & terms | empty | Proper nouns to expect. Helps with names the model nearly gets; see below |
+| Language | Auto-detect | Or pin it, which is slightly faster and safer on quiet openings |
+| Separate and label speakers | on | Off skips the whole diarization half — no token needed |
+| Speakers | Auto-detect | Or set exactly N, or a min–max range |
+| Voice-print speaker check | on | Re-checks each sentence against each voice. Costs a few seconds |
+| Flag uncertain passages | on | Appends the spots worth checking by ear, with timestamps |
+| Sidecar `.json` | on | Needed for instant re-export |
+| `.srt` / `.vtt` | on | Speaker-prefixed cues |
+| LLM chapters + summary | off | Uses your local Ollama (`:11434`); still offline |
+
+Settings live in `%APPDATA%\Sinribe\config.json`.
+
+### What the quality slider is, and what it is not
+
+Its value is the target realtime factor, so "20×" means an hour of audio in three minutes. Each
+position carries the error rate it actually scored on a hard German interview, and the estimated
+time for the file you have loaded — so it reads *"20.4× realtime · 21.3% errors · ≈ 3m 13s for
+this file"* rather than *"high quality"*.
+
+| Slider | Passes | Speed | Errors | |
+|---|---|---|---|---|
+| 84× | 1 | 85× | 23.1 % | turbo German model, batched — needs the optional German models |
+| 50× | 1 | 51× | 21.6 % | `large-v3`, batched |
+| 20× | 1 | 20× | 21.3 % | `large-v3`, one pass in order |
+| 14× | 2 | 15× | 20.8 % | + a batched pass, voted |
+| **10× ★** | 3 | 11× | **20.4 %** | + a second *model*, voted |
+| 5× | 5 | 5.4× | 20.1 % | five passes, two models |
+| 2× | 7 | 2.7× | 20.1 % | seven passes |
+| 1× | 9 | 1.6× | 20.1 % | nine passes, incl. a very wide beam |
+
+**Read the speeds as estimates, not promises.** They were measured on the Linux original, on one
+RTX 5070 Ti, and have never been timed on Windows. The error rates carry over — same weights, same
+settings, same deterministic result — the timings do not. After your first job at a given setting
+the app replaces the shipped figure with what your machine actually did.
+
+Without the optional German models the top rung is unavailable and the voting rungs simply run one
+pass fewer; the interface says which is which.
+
+### How the slow half works, and why the fast half doesn't just do it
+
+Below 20× the audio is transcribed **several times with different settings, and every word is
+decided by majority vote** (`sinribe/rover.py`). Passes that chunk the audio differently mishear
+*different* words, so where two agree against a third the majority is usually right. That takes
+21.3 % down to 20.1 %.
+
+The single biggest step is adding a **different model** (20.8 % → 20.4 %), not re-running the same
+one with different chunking. Two models trained differently make different mistakes; one model
+re-segmented mostly makes the same ones.
+
+What does *not* work is simply searching harder. A beam of 20 costs 5.6× the compute and returns
+21.6 % — worse than the default. Beam search explores one model's own hypotheses, so it only
+rescues an answer the model already had; here the model's probabilities are themselves wrong about
+whether it heard *das* or *es*, and searching a wrong distribution harder returns the same wrong
+answer at five times the price.
+
+Returns flatten at five passes and turn back up past nine, as weaker decodes start outvoting
+better ones. The slowest positions are kept so you can confirm that on your own recordings; the
+★ sits where the curve bends.
+
+### Names & terms — worth trying, not a cure
+
+Whisper mangles proper nouns it has no reason to predict. In one interview *Fujitsu* came back as
+"fiuzi", "jitze" and "future service" — never once correctly — while *VR-Bank* became "Feuerbank".
+Listing the expected names biases the recogniser's vocabulary:
+
+```
+Fujitsu, Siemens, VR-Bank, Ramada, Dr. Mühlbauer
+```
+
+Measured on that interview it is a weak lever. A name the recogniser was already nearly getting
+("Dieter", right once out of three) came good; *Fujitsu* and *VR-Bank* did not move at all, and
+overall WER rose slightly, 21.3 % → 22.3 %. A vocabulary hint is no match for a word the model
+confidently mis-hears. Try it, then check whether it earned its place — `SinribeEval.bat` will say.
+
+### The German models are optional, and not automatically better
+
+`large-v3-german` and `large-v3-turbo-german` are fine-tuned on German alone, where vanilla
+`large-v3` is multilingual. That sounds like a straight upgrade and is not one: on a hard
+far-field Bavarian interview the German fine-tune scored **24.8 % WER against large-v3's 21.3 %**,
+with more substitutions *and* more invented words. Its published numbers come from read speech,
+and the narrower training appears to cost large-v3's robustness on spontaneous, distant, accented
+audio.
+
+They are worth trying on clean, close-miked German — and `SinribeEval.bat` will tell you, which is
+the point. Tick **Add the German speech models** in the setup window, or:
+
+```bat
+.venv\Scripts\python.exe -m sinribe.setup_core --install --german-models
+```
+
+The upstream models ship in transformers format, so this downloads them and converts them to
+CTranslate2, which takes a few minutes of processor time. The conversion runs in a throwaway
+environment on purpose — see `HANDOFF.md` for why nothing may install PyTorch into `.venv`.
+
+---
+
+## Measuring accuracy
+
+Transcription settings are easy to argue about and easy to measure, so Sinribe ships the scorer:
+
+```bat
+SinribeEval.bat reference.docx transcript.md
+```
+
+It aligns the two word by word and reports WER, per-speaker accuracy, how the error rate moves
+over the recording, speaker-attribution accuracy, and the most frequent confusions. The reference
+can be `.docx`, `.odt`, `.md`, `.txt`, `.srt` or `.vtt`; timestamps that restart part-way through
+(a document stitched from two recordings) are handled, and `(unverständlich)` markers are dropped
+rather than counted against the recogniser. German spelling variants — `softskills`/`soft skills`,
+`gernhabt`/`gern habt` — score as correct, because they are.
+
+To compare settings instead of grading one run:
+
+```bat
+SinribeEval.bat --sweep variants.json audio.wav reference.docx -o results.json
+```
+
+Each variant re-decodes the audio and is scored; the decoded audio and the diarization are shared
+between variants, so only the recognition pass is repeated.
+
+And to answer "is more tuning worth it?" rather than "which of these is best?":
+
+```bat
+SinribeEval.bat --ceiling "%LOCALAPPDATA%\Sinribe\sweep" reference.docx
+```
+
+That scores every transcript it finds and reports what a *perfect* choice between them would
+score. The gap to the best single configuration is the entire prize available to any cleverer
+scheme; the words none of them get right are the floor. On the benchmark interview the floor is
+8.7 % of all words — fast, broad-dialect, far-field speech that no setting reaches — which is how
+two-model consensus decoding got cancelled before it was built.
+
+---
+
 ## How fast is it?
 
 On the Linux machine this was ported from — an RTX 5070 Ti laptop — a four-hour recording with
-three speakers takes **11 minutes**, about 22× realtime. Windows numbers on comparable hardware
-should be in the same range and have not been measured; see `HANDOFF.md`, which is explicit
-about what has and has not been verified.
+three speakers takes **11 minutes**, about 22× realtime at the fast end of the slider. Windows
+numbers on comparable hardware should be in the same range and **have not been measured**; see
+`HANDOFF.md`, which is explicit about what has and has not been verified.
 
 Without an NVIDIA card everything still works, on the processor, several times slower than
 realtime with `large-v3`. Choose `small` and it is roughly realtime — an hour of audio in about
@@ -142,6 +298,12 @@ resume too, including during setup.
 **Speaker count.** Auto-detection is good but not psychic. If you know there are exactly two
 people, say so under Options — it measurably improves attribution.
 
+**Speaker labels get a second opinion.** After transcribing, Sinribe builds a voice print for each
+speaker from the diarizer's long, unambiguous turns, then re-checks every sentence against them and
+overrules the diarizer where the acoustic match is decisive. It is the only fix for a short answer
+that got swallowed into the previous question, and it costs a few seconds. Untick *Voice-print
+speaker check* to skip it.
+
 **Chapters and a summary.** If you happen to run [Ollama](https://ollama.com), tick *LLM
 chapters + summary* and Sinribe asks your local model for section titles and an overview. Off by
 default, entirely local, and skipped silently if Ollama is not there.
@@ -152,6 +314,7 @@ default, entirely local, and skipped silently if Ollama is not there.
 |---|---|
 | Settings, HuggingFace token | `%APPDATA%\Sinribe` |
 | Models, checkpoints, downloads | `%LOCALAPPDATA%\Sinribe` |
+| Converted German models | `%LOCALAPPDATA%\Sinribe\ct2-models` |
 | Python, FFmpeg, uv | inside the Sinribe folder (`.venv`, `.venv-diar`, `tools\`) |
 | Transcripts | `Documents\Sinribe Transcripts` by default |
 

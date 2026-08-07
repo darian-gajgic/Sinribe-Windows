@@ -28,7 +28,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sinribe import setup_core, winenv                                       # noqa: E402
-from sinribe.config import WHISPER_MODELS, hf_token, load_config, save_config  # noqa: E402
+from sinribe.config import (  # noqa: E402
+    LOCAL_MODELS, WHISPER_MODELS, hf_token, load_config, model_available, save_config,
+)
 
 # The app's palette, hand-mapped to tk's flat colour options.
 BG = "#0c0d11"
@@ -145,7 +147,7 @@ class Wizard:
         self.model_var = tk.StringVar()
         self.model_choices = [f"{n} — {gb:.1f} GB · {note}" for n, _r, gb, note in WHISPER_MODELS]
         self.model_names = [n for n, _r, _gb, _note in WHISPER_MODELS]
-        want = str(self.cfg.get("asr_model", "large-v3"))
+        want = setup_core.downloadable_model(self.cfg)
         # large-v3 on a CPU-only machine runs at about half realtime — an hour of audio takes
         # two. Steer that case to a model the machine can actually keep up with.
         if not winenv.cuda_supported(self.gpu) and want == "large-v3":
@@ -172,6 +174,15 @@ class Wizard:
         ttk.Checkbutton(opts, text="Separate and label speakers (adds about 3 GB)",
                         variable=self.diar_var,
                         command=self.refresh).pack(anchor="w", pady=(8, 4))
+
+        # Off by default. It is another ~5 GB and a few minutes of conversion, and it only helps
+        # German recordings — on a hard far-field German interview plain large-v3 still measured
+        # more accurate. Offered here because the fastest quality setting runs one of them.
+        self.german_var = tk.BooleanVar(
+            value=all(model_available(n) for n in LOCAL_MODELS))
+        ttk.Checkbutton(opts, text="Add the German speech models (optional, about 5 GB)",
+                        variable=self.german_var,
+                        command=self.refresh).pack(anchor="w", pady=(0, 4))
 
         self.token_frame = ttk.Frame(opts, style="Card.TFrame")
         self.token_frame.pack(fill="x")
@@ -233,7 +244,8 @@ class Wizard:
         name = self.model_names[self.model_choices.index(self.model_var.get())]
         return setup_core.Options(
             model=name, gpu=gpu, diarize=bool(self.diar_var.get()),
-            hf_token=self.token_var.get().strip(), shortcuts=True)
+            hf_token=self.token_var.get().strip(), shortcuts=True,
+            german_models=bool(self.german_var.get()))
 
     def refresh(self) -> None:
         opts = self.options()
@@ -294,7 +306,7 @@ class Wizard:
                 f"connection.\n\nStart now?"):
             return
 
-        self.cfg["asr_model"] = opts.model
+        setup_core.remember_model(self.cfg, opts.model)
         self.cfg["diarize"] = opts.diarize
         dev = self.device_var.get()
         self.cfg["asr_device"] = ("cpu" if dev.startswith("Processor")

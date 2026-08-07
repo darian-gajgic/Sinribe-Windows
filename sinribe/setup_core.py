@@ -30,8 +30,8 @@ from typing import Callable, Iterable
 
 from . import winenv
 from .config import (
-    DIAR_SUPPORT_REPOS, WHISPER_REPOS, WHISPER_SIZES_GB, hf_token, load_state, save_hf_token,
-    save_state,
+    DIAR_SUPPORT_REPOS, LOCAL_MODEL_SIZES_GB, LOCAL_MODELS, MODELS_DIR, WHISPER_REPOS,
+    WHISPER_SIZES_GB, hf_token, load_state, model_available, model_dir, save_hf_token, save_state,
 )
 from .winenv import (
     APP_ROOT, ASR_VENV, DIAR_VENV, FFMPEG_DIR, IS_WINDOWS, PYTHON_VERSION, TOOLS_DIR, UV_EXE,
@@ -74,6 +74,9 @@ SIZE_GB = {
     "diar_venv_cpu": 0.60,
     "diar_venv_cuda": 3.20,
     "diar_model": 0.10,
+    # The throwaway conversion environment: CPU torch plus transformers. Thrown away again the
+    # moment the conversion finishes, but it is downloaded, so it belongs in the estimate.
+    "ct2_tools": 0.35,
 }
 
 
@@ -94,6 +97,10 @@ class Options:
     diarize: bool = True
     hf_token: str = ""
     shortcuts: bool = True
+    #: Convert the German whisper fine-tunes. Off by default: it is another ~5 GB and a few
+    #: minutes of CPU, and it only helps German recordings — on a hard far-field German
+    #: interview plain large-v3 still measured better.
+    german_models: bool = False
 
     def resolve_gpu(self, gpu_info: winenv.GpuInfo | None = None) -> bool:
         if self.gpu is not None:
@@ -360,12 +367,60 @@ def detect(opts: Options | None = None) -> list[Component]:
         required=opts.diarize,
         size_gb=0.0 if have_diar_model else SIZE_GB["diar_model"]))
 
+    missing_de = [n for n in LOCAL_MODELS if not model_available(n)]
+    out.append(Component(
+        "german_models", "German speech models (optional)", not missing_de,
+        "converted" if not missing_de
+        else f"{len(missing_de)} to download and convert (~{_german_gb(missing_de):.1f} GB)",
+        required=opts.german_models,
+        size_gb=0.0 if not missing_de else _german_gb(missing_de) + SIZE_GB["ct2_tools"]))
+
     return out
+
+
+def _german_gb(names: Iterable[str]) -> float:
+    return sum(LOCAL_MODEL_SIZES_GB.get(n, 1.5) for n in names)
 
 
 def _default_pipeline() -> str:
     from .config import DIAR_PIPELINES, load_config
     return str(load_config().get("diar_pipeline") or DIAR_PIPELINES[0])
+
+
+def resolved_model(cfg: dict) -> str:
+    """The model a job with this config would actually load.
+
+    The dropdown may say "auto", which hands the choice to the quality slider. Everything that
+    asks "is the model installed" has to ask about the resolved name, not the stored one.
+    """
+    from . import presets
+    return presets.model_for(cfg)
+
+
+def downloadable_model(cfg: dict) -> str:
+    """The HuggingFace model setup should install for this config.
+
+    A locally converted model has no HuggingFace build to download, and the pipeline needs a
+    plain whisper model in any case — every voting rung starts from one. So a config pinned to
+    a German fine-tune still gets large-v3 downloaded underneath it.
+    """
+    model = resolved_model(cfg)
+    if model in WHISPER_REPOS:
+        return model
+    return "large-v3"
+
+
+def remember_model(cfg: dict, chosen: str) -> None:
+    """Record the setup window's model choice, without clobbering an "auto" delegation.
+
+    Both setup surfaces call this. Setup asks which model to *download*; the main window's
+    dropdown says which to *use*, and "auto" there means "whatever the quality slider picks".
+    Writing the download choice back unconditionally would silently pin every user who had left
+    that decision to the slider — including the ones who only opened setup to add a token.
+    """
+    if str(cfg.get("asr_model")) == "auto" and downloadable_model(cfg) == chosen:
+        return
+    cfg["asr_model"] = chosen
 
 
 def missing(components: Iterable[Component]) -> list[Component]:
@@ -397,7 +452,15 @@ def launch_blockers(cfg: dict | None = None) -> list[str]:
     if not winenv.have_ffmpeg():
         out.append("FFmpeg is missing (needed to read audio and video files)")
 
-    model = str(cfg.get("asr_model", "large-v3"))
+    # What this job would actually load: "auto" hands the choice to the quality slider, so the
+    # dropdown's value is not necessarily the model that has to be present.
+    #
+    # An uninstalled *converted* model is deliberately NOT a blocker, even though a job using it
+    # would fail. Blocking here refuses to open the main window at all, and the only place to
+    # change the quality setting is inside that window — so a user who parked the slider on the
+    # German rung would be locked out of the one control that fixes it. The window catches that
+    # combination when Start is pressed instead, and the pipeline catches it again after that.
+    model = resolved_model(cfg)
     repo = WHISPER_REPOS.get(model)
     if repo and not winenv.model_is_cached(repo):
         out.append(f"the {model} speech model has not been downloaded")
@@ -679,6 +742,111 @@ def ensure_diar_model(opts: Options, progress: Progress) -> None:
         script.unlink(missing_ok=True)
 
 
+#: Where the throwaway conversion environment is built. Under the app's own tools/ rather than a
+#: temp directory: it is several hundred MB, and a Windows temp cleaner running mid-conversion
+#: would be an unpleasant way to find that out.
+CT2_VENV = TOOLS_DIR / "_ct2conv"
+
+#: The tokenizer some of these repos do not ship. faster-whisper loads tokenizer.json (the fast
+#: tokenizer); several publishers upload only the slow tokenizer's vocab.json + merges.txt, so it
+#: is built here rather than depended on.
+_TOKENIZER_SCRIPT = (
+    "import sys\n"
+    "from transformers import AutoTokenizer\n"
+    "AutoTokenizer.from_pretrained(sys.argv[1]).save_pretrained(sys.argv[2])\n"
+)
+
+
+def ensure_german_models(opts: Options, progress: Progress) -> None:
+    """Download the German whisper fine-tunes and convert them to CTranslate2 form.
+
+    The upstream repos publish transformers weights; faster-whisper reads CTranslate2 ones, so
+    the conversion happens here, once, on this machine.
+
+    It runs in a THROWAWAY virtualenv with CPU-only torch, and that is not tidiness. The
+    transcription venv holds the ctranslate2 / CUDA-12 stack; PyPI torch brings CUDA 13, and the
+    two cuDNN majors collide. Putting transformers into .venv is precisely the breakage the
+    two-environment split exists to prevent. The conversion environment is deleted afterwards.
+    """
+    if not opts.german_models:
+        return
+    todo = [n for n in LOCAL_MODELS if not model_available(n)]
+    if not todo:
+        progress.log("German models already converted")
+        return
+    if not UV_EXE.is_file():
+        raise SetupError("uv is needed to convert the German models — run setup again")
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    progress.log(f"converting {len(todo)} model(s) into {MODELS_DIR}")
+    try:
+        _build_ct2_venv(progress)
+        for i, name in enumerate(todo, start=1):
+            progress.check()
+            progress.step(i, len(todo), f"Converting {name}")
+            _convert_one(name, progress)
+    finally:
+        # Best effort: on Windows a just-exited process can still hold a handle for a moment,
+        # and a leftover 350 MB directory is a far smaller problem than a setup that reports
+        # failure after doing all the work correctly.
+        shutil.rmtree(CT2_VENV, ignore_errors=True)
+
+
+def _build_ct2_venv(progress: Progress) -> None:
+    if winenv.venv_python(CT2_VENV).is_file():
+        progress.log("conversion environment already present")
+        return
+    _run([str(UV_EXE), "venv", "--python", PYTHON_VERSION, str(CT2_VENV)], progress,
+         what="creating the conversion environment")
+    # CPU torch: the converter never runs the model, it rewrites weights, so a CUDA build would
+    # be gigabytes spent on nothing. `unsafe-best-match` lets transformers resolve from PyPI
+    # while torch comes from the PyTorch index.
+    _run([str(UV_EXE), "pip", "install", "--python", str(winenv.venv_python(CT2_VENV)),
+          "--index-strategy", "unsafe-best-match",
+          "--index-url", winenv.CPU_INDEX,
+          "--extra-index-url", "https://pypi.org/simple",
+          "torch", "transformers", "ctranslate2==4.8.0"],
+         progress, what="installing the conversion tools")
+
+
+def _convert_one(name: str, progress: Progress) -> None:
+    dest = model_dir(name)
+    repo = LOCAL_MODELS[name][1]
+    if dest is None:
+        raise SetupError(f"{name} is not a locally converted model")
+    # Written to a .part directory and moved into place only on success, so an interrupted
+    # download can never leave a half-model that Sinribe would then try to load.
+    part = dest.with_name(dest.name + ".part")
+    shutil.rmtree(part, ignore_errors=True)
+
+    exe = CT2_VENV / ("Scripts" if IS_WINDOWS else "bin") / (
+        "ct2-transformers-converter.exe" if IS_WINDOWS else "ct2-transformers-converter")
+    if not exe.is_file():
+        raise SetupError(f"the conversion tool is missing at {exe}")
+
+    env = _model_env(ASR_VENV)
+    env["HF_HUB_OFFLINE"] = "0"
+    progress.log(f"downloading and converting {repo} "
+                 f"(~{LOCAL_MODEL_SIZES_GB.get(name, 1.5):.1f} GB)")
+    _run([str(exe), "--model", repo, "--output_dir", str(part),
+          "--copy_files", "preprocessor_config.json", "--quantization", "float16", "--force"],
+         progress, env=env, what=f"converting {name}")
+
+    script = TOOLS_DIR / "_fetch_tokenizer.py"
+    script.write_text(_TOKENIZER_SCRIPT, encoding="utf-8")
+    try:
+        _run([str(winenv.venv_python(CT2_VENV)), str(script), repo, str(part)], progress,
+             env=env, what=f"building the tokenizer for {name}")
+    finally:
+        script.unlink(missing_ok=True)
+
+    if not (part / "model.bin").is_file():
+        raise SetupError(f"{name} converted without producing a model.bin")
+    shutil.rmtree(dest, ignore_errors=True)
+    part.replace(dest)
+    progress.log(f"installed {name} at {dest}")
+
+
 def ensure_shortcuts(opts: Options, progress: Progress) -> None:
     """Desktop + Start Menu shortcuts, via the bundled PowerShell script."""
     if not opts.shortcuts:
@@ -707,6 +875,7 @@ STEPS: list[tuple[str, str, Callable[[Options, Progress], None]]] = [
     ("whisper_model", "Speech model", ensure_whisper_model),
     ("diar_venv", "Speaker separation", ensure_diar_venv),
     ("diar_model", "Speaker model", ensure_diar_model),
+    ("german_models", "German models", ensure_german_models),
     ("shortcuts", "Shortcuts", ensure_shortcuts),
 ]
 
@@ -782,6 +951,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gpu", action="store_true", help="force the CUDA stack")
     ap.add_argument("--no-diarize", action="store_true",
                     help="skip speaker separation (no HuggingFace token needed)")
+    ap.add_argument("--german-models", action="store_true",
+                    help="also download and convert the German whisper fine-tunes (~5 GB)")
     ap.add_argument("--token", default="", help="HuggingFace token, saved for later runs")
     ap.add_argument("--no-shortcuts", action="store_true")
     args = ap.parse_args(argv)
@@ -789,11 +960,14 @@ def main(argv: list[str] | None = None) -> int:
     from .config import load_config
     cfg = load_config()
     opts = Options(
-        model=args.model or str(cfg.get("asr_model", "large-v3")),
+        # Never "auto" — Options.model names one model to download, and the stored value may be
+        # a slider delegation or a converted model that has no HuggingFace build.
+        model=args.model or downloadable_model(cfg),
         gpu=True if args.gpu else (False if args.cpu else None),
         diarize=not args.no_diarize and bool(cfg.get("diarize", True)),
         hf_token=args.token,
         shortcuts=not args.no_shortcuts,
+        german_models=args.german_models,
     )
 
     if args.check or not args.install:

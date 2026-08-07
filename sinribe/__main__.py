@@ -68,6 +68,10 @@ def _cli(args: argparse.Namespace) -> int:
     cfg = load_config()
     if args.model:
         cfg["asr_model"] = args.model
+    if args.quality:
+        cfg["speed_target"] = args.quality
+    if args.hotwords:
+        cfg["hotwords"] = args.hotwords
     if args.language:
         cfg["language"] = args.language
     if args.speakers:
@@ -174,7 +178,13 @@ def main() -> int:
     ap.add_argument("audio", nargs="?",
                     help="audio/video file, or a YouTube/podcast URL (implies --cli)")
     ap.add_argument("-o", "--output", help="output directory")
-    ap.add_argument("-m", "--model", help="whisper model (large-v3, medium, small, tiny, …)")
+    ap.add_argument("-m", "--model",
+                    help="whisper model, or 'auto' to let --quality choose "
+                         "(large-v3, medium, small, tiny, large-v3-german, "
+                         "large-v3-turbo-german, …)")
+    ap.add_argument("-q", "--quality", type=int, metavar="RTF",
+                    help="target realtime factor: 1 is slowest and most accurate, 84 fastest")
+    ap.add_argument("--hotwords", help="comma-separated names and jargon to expect")
     ap.add_argument("-l", "--language", help="language code, or 'auto'")
     ap.add_argument("-s", "--speakers", type=int, help="exact number of speakers")
     ap.add_argument("--enrich", action="store_true", help="force LLM chapters + summary on")

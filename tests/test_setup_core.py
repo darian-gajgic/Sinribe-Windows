@@ -12,7 +12,7 @@ import zipfile
 
 import pytest
 
-from sinribe import setup_core, winenv
+from sinribe import config, setup_core, winenv
 from sinribe.setup_core import Component, Options, Progress
 
 
@@ -30,6 +30,10 @@ def sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr(setup_core, "UV_EXE", tmp_path / "tools" / "uv.exe")
     monkeypatch.setattr(setup_core, "_managed_python", lambda: None)
     monkeypatch.setattr(winenv, "gpu_info", lambda: winenv.GpuInfo())
+    # The locally converted models live outside the HuggingFace cache, so HF_HOME does not
+    # cover them; redirect them too or a test would see whatever this machine happens to have.
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path / "ct2-models")
+    monkeypatch.setattr(setup_core, "MODELS_DIR", tmp_path / "ct2-models")
     return tmp_path
 
 
@@ -188,7 +192,7 @@ class TestInstallSequencing:
         monkeypatch.setattr(setup_core, "STEPS",
                             [(k, k.title(), make(k)) for k in
                              ("uv", "python", "ffmpeg", "asr_venv", "whisper_model",
-                              "diar_venv", "diar_model", "shortcuts")])
+                              "diar_venv", "diar_model", "german_models", "shortcuts")])
         monkeypatch.setattr(setup_core, "save_state", lambda state: None)
         monkeypatch.setattr(setup_core, "load_state", dict)
         monkeypatch.setattr(setup_core, "save_hf_token", lambda tok: None)
@@ -197,7 +201,7 @@ class TestInstallSequencing:
     def test_everything_runs_in_dependency_order_by_default(self, recorder):
         setup_core.install(Options())
         assert recorder == ["uv", "python", "ffmpeg", "asr_venv", "whisper_model",
-                            "diar_venv", "diar_model", "shortcuts"]
+                            "diar_venv", "diar_model", "german_models", "shortcuts"]
 
     def test_only_restricts_the_walk_but_keeps_the_order(self, recorder):
         setup_core.install(Options(), only=["shortcuts", "asr_venv", "uv"])
@@ -271,3 +275,107 @@ class TestProgress:
         p = Progress(should_cancel=lambda: True)
         with pytest.raises(setup_core.Cancelled):
             p.check()
+
+
+def _convert_model(name: str) -> None:
+    """Fake a finished CTranslate2 conversion."""
+    d = config.model_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model.bin").write_bytes(b"x")
+    (d / "tokenizer.json").write_text("{}")
+
+
+class TestModelResolution:
+    """"auto" is a delegation to the quality slider, not a model. Everything that asks whether
+    a model is installed has to resolve it first, or a converted model is never checked at all.
+    """
+
+    def test_auto_resolves_to_the_rungs_model(self):
+        assert setup_core.resolved_model({"asr_model": "auto", "speed_target": 10}) == "large-v3"
+
+    def test_auto_can_resolve_to_a_converted_model(self):
+        # The fastest rung runs a German fine-tune, which is not a HuggingFace download.
+        model = setup_core.resolved_model({"asr_model": "auto", "speed_target": 84})
+        assert model in config.LOCAL_MODELS
+
+    def test_a_pin_wins(self):
+        assert setup_core.resolved_model({"asr_model": "small", "speed_target": 10}) == "small"
+
+    def test_setup_never_tries_to_download_a_converted_model(self):
+        # Options.model names one HuggingFace repository to fetch. A German fine-tune has none,
+        # and every voting rung needs a plain whisper model underneath it anyway.
+        cfg = {"asr_model": "large-v3-turbo-german", "speed_target": 10}
+        assert setup_core.downloadable_model(cfg) == "large-v3"
+        assert setup_core.downloadable_model({"asr_model": "auto", "speed_target": 84}) \
+            == "large-v3"
+
+    def test_setup_does_not_pin_a_user_who_left_it_on_auto(self):
+        cfg = {"asr_model": "auto", "speed_target": 10}
+        setup_core.remember_model(cfg, "large-v3")
+        assert cfg["asr_model"] == "auto"
+
+    def test_setup_does_pin_a_deliberate_change(self):
+        cfg = {"asr_model": "auto", "speed_target": 10}
+        setup_core.remember_model(cfg, "small")
+        assert cfg["asr_model"] == "small"
+
+
+class TestGermanModels:
+    """Optional, converted locally, and — unlike a whisper model — not fetchable at job time."""
+
+    def test_absent_by_default_and_not_required(self, sandbox):
+        comps = {c.key: c for c in setup_core.detect(Options())}
+        assert not comps["german_models"].ok
+        assert not comps["german_models"].required
+
+    def test_asking_for_them_makes_them_a_planned_step(self, sandbox):
+        keys, _gb = setup_core.plan(Options(german_models=True, diarize=False))
+        assert "german_models" in keys
+
+    def test_not_asking_for_them_leaves_them_out_of_the_plan(self, sandbox):
+        keys, _gb = setup_core.plan(Options(diarize=False))
+        assert "german_models" not in keys
+
+    def test_a_finished_conversion_is_recognised(self, sandbox):
+        for name in config.LOCAL_MODELS:
+            _convert_model(name)
+        comps = {c.key: c for c in setup_core.detect(Options(german_models=True))}
+        assert comps["german_models"].ok
+        assert setup_core.plan(Options(german_models=True, diarize=False))[1] < 4.0
+
+    def test_a_half_finished_conversion_does_not_count(self, sandbox):
+        # An interrupted convert leaves the directory behind. Treating that as installed sends
+        # the next job into faster-whisper with no weights to load.
+        d = config.model_dir("large-v3-german")
+        d.mkdir(parents=True)
+        assert not config.model_available("large-v3-german")
+
+    def test_installing_them_is_a_no_op_when_they_are_there(self, sandbox, monkeypatch):
+        for name in config.LOCAL_MODELS:
+            _convert_model(name)
+        monkeypatch.setattr(setup_core, "_build_ct2_venv",
+                            lambda *a: pytest.fail("should not have built a venv"))
+        setup_core.ensure_german_models(Options(german_models=True), Progress())
+
+    def test_they_are_skipped_entirely_when_not_asked_for(self, sandbox, monkeypatch):
+        monkeypatch.setattr(setup_core, "_build_ct2_venv",
+                            lambda *a: pytest.fail("should not have built a venv"))
+        setup_core.ensure_german_models(Options(german_models=False), Progress())
+
+    def test_a_missing_conversion_does_not_lock_the_window(self, sandbox, monkeypatch):
+        # Blocking launch would refuse to open the main window, and the quality slider — the only
+        # control that can undo this — lives inside it. The window checks on Start instead.
+        _make_venv(sandbox, ".venv", ["faster_whisper", "ctranslate2"])
+        _cache_model("Systran/faster-whisper-large-v3")
+        monkeypatch.setattr(winenv, "have_ffmpeg", lambda: True)
+        cfg = {"asr_model": "large-v3-turbo-german", "diarize": False}
+        assert not config.model_available("large-v3-turbo-german")
+        assert setup_core.launch_blockers(cfg) == []
+
+    def test_a_missing_whisper_download_still_blocks(self, sandbox, monkeypatch):
+        # The other half of the same decision: a HuggingFace model is fetched by the job itself,
+        # but only if it was ever asked for — an install that never downloaded one is not ready.
+        _make_venv(sandbox, ".venv", ["faster_whisper", "ctranslate2"])
+        monkeypatch.setattr(winenv, "have_ffmpeg", lambda: True)
+        blockers = setup_core.launch_blockers({"asr_model": "large-v3", "diarize": False})
+        assert any("has not been downloaded" in b for b in blockers)

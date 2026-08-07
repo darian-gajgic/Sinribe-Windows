@@ -19,9 +19,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import audio, enrich as enrich_mod, fetch, winenv
-from .config import DOWNLOADS_DIR, JOBS_DIR, WHISPER_REPOS, hf_token
-from .merge import DiarTurn, Word, merge
+from . import audio, enrich as enrich_mod, fetch, presets, rover, winenv
+from .config import (
+    DOWNLOADS_DIR, JOBS_DIR, WHISPER_REPOS, hf_token, model_available, resolve_model,
+    supports_hotwords,
+)
+from .merge import DiarTurn, SentenceScore, Word, merge, sentence_spans
 from .render import markdown, sidecar, subtitles
 from .textfmt import human_duration
 
@@ -38,15 +41,18 @@ STAGE_SHARES = {
     "decode": 0.04,
     "diarize": 0.28,
     "transcribe": 0.62,
+    "refine": 0.03,
     "finish": 0.06,
 }
 
 
-def stage_spans(with_fetch: bool) -> dict[str, tuple[float, float]]:
+def stage_spans(with_fetch: bool, with_refine: bool = True) -> dict[str, tuple[float, float]]:
     """Map each stage to its (start, width) on the 0..1 progress bar."""
     shares = dict(STAGE_SHARES)
     if not with_fetch:
         shares.pop("fetch")
+    if not with_refine:
+        shares.pop("refine")
     total = sum(shares.values())
     spans: dict[str, tuple[float, float]] = {}
     acc = 0.0
@@ -370,15 +376,20 @@ class Runner:
         return pick_asr_tier(free_vram_mib())
 
     def _decode(self, info: audio.MediaInfo, cache: Path) -> Path:
-        wav = cache / "decoded.wav"
+        # Conditioned audio gets its own filename so the untouched decode stays cached alongside
+        # it — a sweep that compares filters would otherwise re-decode the source every time.
+        chain = str(presets.decode_settings(self.cfg).get("audio_filter") or "")
+        wav = cache / (f"decoded-{chain}.wav" if chain else "decoded.wav")
         if wav.exists() and wav.stat().st_size > 1024:
             self.log(f"reusing decoded audio ({wav.stat().st_size / 1e6:.0f} MB)")
             self._frac(1.0)
             return wav
-        self.log(f"decoding {info.codec} -> 16 kHz mono WAV")
+        self.log(f"decoding {info.codec} -> 16 kHz mono WAV"
+                 + (f" ({chain} filter)" if chain else ""))
         audio.decode_to_wav(info.path, wav, info.duration,
                             on_progress=lambda f: self._frac(f),
-                            should_cancel=self.cancelled)
+                            should_cancel=self.cancelled,
+                            filter_chain=chain)
         return wav
 
     def _diarize(self, wav: Path, cache: Path) -> list[DiarTurn]:
@@ -395,6 +406,10 @@ class Runner:
             "num_speakers": self.cfg.get("num_speakers"),
             "min_speakers": self.cfg.get("min_speakers"),
             "max_speakers": self.cfg.get("max_speakers"),
+            # Diarization runs on the same WAV the recogniser gets, so conditioning the audio
+            # changes its turns too. Without this key a filtered run would silently reuse turns
+            # computed from the untouched audio.
+            "audio_filter": presets.decode_settings(self.cfg).get("audio_filter") or "",
         }
         ck = cache / "diar.json"
         if ck.exists():
@@ -430,14 +445,136 @@ class Runner:
                                   "turns": [t.__dict__ for t in turns]}))
         return turns
 
+    def _refine(self, wav: Path, words: list[Word], diar_turns: list[DiarTurn],
+                cache: Path) -> list[SentenceScore]:
+        """Score every sentence against the speakers' voice prints; [] means 'no opinion'.
+
+        Failures here are deliberately non-fatal: the stage only ever *improves* attribution, so a
+        missing venv or an unexpected model error should cost accuracy, not the transcript.
+        """
+        spans = sentence_spans(words)
+        if not spans or len({t.speaker for t in diar_turns}) < 2:
+            self._frac(1.0)
+            return []
+
+        sentences = [{"start": round(words[s[0]].start, 3), "end": round(words[s[-1]].end, 3)}
+                     for s in spans]
+        # Keyed on the sentence BOUNDARIES, not just how many there are. Two decodes of the same
+        # audio routinely produce the same sentence count with different spans, and a count-only
+        # key would then hand the second one voice-print scores computed for the first one's
+        # audio — invisible, and exactly the kind of thing a config sweep would blame on the knob
+        # it was testing.
+        digest = hashlib.sha1(
+            json.dumps(sentences, sort_keys=True).encode()).hexdigest()[:16]
+        settings = {"pipeline": self.cfg.get("diar_pipeline"), "n": len(sentences),
+                    "spans": digest}
+        ck = cache / "refine.json"
+        if ck.exists():
+            try:
+                data = json.loads(ck.read_text())
+                if data.get("settings") == settings:
+                    scores = [SentenceScore(**s) for s in data["scores"]]
+                    self.log(f"reusing speaker-refinement checkpoint ({len(scores)} sentences)")
+                    self._frac(1.0)
+                    return scores
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        job = {"wav": str(wav), "sentences": sentences,
+               "turns": [t.__dict__ for t in diar_turns],
+               "pipeline": self.cfg.get("diar_pipeline"), "hf_token": hf_token(),
+               "device": "cuda"}
+        scores: list[SentenceScore] = []
+        try:
+            for ev in self._run_worker(DIAR_PYTHON, "sinribe.workers.refine_worker",
+                                       job, _diar_env()):
+                kind = ev.get("ev")
+                if kind == "progress":
+                    self._frac(float(ev.get("done", 0.0)))
+                elif kind == "result":
+                    scores = [SentenceScore(speaker=s.get("speaker"),
+                                            margin=float(s.get("margin") or 0.0))
+                              for s in ev.get("scores", [])]
+                elif kind == "error":
+                    self.log(f"speaker refinement unavailable: {ev.get('msg')}")
+        except Cancelled:
+            raise
+        except StageError as e:
+            self.log(f"speaker refinement skipped: {e}")
+            return []
+
+        self._check()  # never persist a checkpoint from an interrupted stage
+        if scores:
+            ck.write_text(json.dumps({"settings": settings,
+                                      "scores": [s.__dict__ for s in scores]}))
+        return scores
+
     def _transcribe(self, wav: Path, duration: float, cache: Path) -> tuple[list[Word], dict]:
+        """Decode the audio, voting across several passes when the quality rung asks for it."""
+        rung = presets.for_target(self.cfg.get("speed_target", 20))
+        extra = list(getattr(rung, "extra_passes", ()) or ())
+        if not extra:
+            return self._transcribe_once(wav, duration, cache)
+
+        # Several decodes, then a word-by-word majority vote. This is the only thing measured
+        # that converts more compute into fewer errors: 21.3 % for one pass against 20.1 % for
+        # five, because the passes chunk the audio differently and so make *different* mistakes.
+        passes: list[list[Word]] = []
+        info: dict = {}
+        base_overrides = dict(self.cfg.get("decode_overrides") or {})
+        for i, override in enumerate([{}] + extra):
+            self._check()
+            job_cfg = dict(self.cfg)
+            job_cfg["decode_overrides"] = {**base_overrides, **override}
+            # A pass may name a model the user never installed. Skipping it costs a little
+            # accuracy; failing the whole job over an optional extra decode would be absurd.
+            if not model_available(presets.model_for(job_cfg)):
+                self.log(f"pass {i + 1} skipped — {presets.model_for(job_cfg)} is not installed "
+                         f"(open Setup and add the German models for the full quality range)")
+                continue
+            words, pass_info = self._transcribe_once(
+                wav, duration, cache, cfg=job_cfg, tag=f"pass{i}")
+            self.log(f"pass {i + 1}/{len(extra) + 1}: {len(words)} words")
+            passes.append(words)
+            if not info:
+                info = pass_info
+
+        merged = rover.combine(passes)
+        agree = rover.agreement(passes)
+        self.log(f"voted {len(passes)} passes -> {len(merged)} words "
+                 f"({agree:.0%} of positions were unanimous)")
+        info = dict(info)
+        info.update({"passes": len(passes), "vote_agreement": round(agree, 4)})
+        return merged, info
+
+    def _transcribe_once(self, wav: Path, duration: float, cache: Path,
+                         cfg: dict | None = None, tag: str = "") -> tuple[list[Word], dict]:
+        cfg = self.cfg if cfg is None else cfg
+        decode = presets.decode_settings(cfg)
+        model_name = presets.model_for(cfg)
+        accurate = str(decode["asr_mode"]) == "accurate"
+        # The checkpoint key. EVERY setting that can change the words must appear here. A knob
+        # that is passed to the worker but left out of this dict makes a re-run silently reuse
+        # the previous result — during a config sweep that shows up as every variant scoring
+        # identically, which reads like "the setting does nothing" rather than like a bug.
+        hotwords = (cfg.get("hotwords") or "").strip()
+        if hotwords and not supports_hotwords(model_name):
+            # Dropped rather than fatal: the transcript is what the user came for, and this
+            # combination would otherwise return an empty one. Said loudly, because silently
+            # ignoring names the user typed is its own kind of wrong.
+            self.log(f"WARNING: {model_name} returns an empty transcript when given hotwords, "
+                     f"so 'Names & terms' is being ignored for this run. Use large-v3 or "
+                     f"large-v3-turbo-german if you need it.")
+            hotwords = ""
+
         settings = {
-            "model": self.cfg.get("asr_model"),
-            "language": self.cfg.get("language"),
-            "beam_size": self.cfg.get("beam_size"),
-            "vad_filter": self.cfg.get("vad_filter"),
+            "model": model_name,
+            "language": cfg.get("language"),
+            "vad_filter": cfg.get("vad_filter"),
+            "hotwords": hotwords,
+            **{k: decode[k] for k in sorted(decode)},
         }
-        ck = cache / "asr.json"
+        ck = cache / (f"asr-{tag}.json" if tag else "asr.json")
         if ck.exists():
             try:
                 data = json.loads(ck.read_text())
@@ -449,12 +586,13 @@ class Runner:
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
-        lang = self.cfg.get("language")
+        lang = cfg.get("language")
         tier = self._start_tier()
-        model_name = str(self.cfg.get("asr_model", "large-v3"))
         repo = WHISPER_REPOS.get(model_name)
-        # A model the machine has never seen has to come from the network once. Everything else
-        # stays offline; this is the only reason the ASR worker is ever allowed online.
+        # A HuggingFace model the machine has never seen has to come from the network once.
+        # Everything else stays offline; this is the only reason the ASR worker is ever allowed
+        # online. Locally converted models are not in WHISPER_REPOS and never take this path —
+        # they cannot be downloaded at all, which is why `model_available` gates them earlier.
         offline = not repo or winenv.model_is_cached(repo)
         if not offline:
             self.log(f"first use of {model_name}: downloading it from HuggingFace "
@@ -463,18 +601,34 @@ class Runner:
 
         while tier < len(ASR_TIERS):
             device, compute_type, batch = ASR_TIERS[tier]
-            if self.cfg.get("asr_model") == "large-v3" and device == "cpu":
+            if model_name.startswith("large-v3") and device == "cpu":
                 self.log("WARNING: falling back to CPU — large-v3 runs ~0.5x realtime there")
             job = {
                 "wav": str(wav), "duration": duration,
-                "model": model_name, "offline": offline,
-                "device": device, "compute_type": compute_type, "batch_size": batch,
-                "beam_size": int(self.cfg.get("beam_size", 5)),
+                "model": resolve_model(model_name), "offline": offline,
+                "device": device, "compute_type": compute_type,
+                # Accurate mode decodes sequentially. Batching splits the audio at VAD boundaries
+                # and decodes the pieces independently, which is where words at chunk edges go
+                # missing and where word timestamps lose the precision attribution needs.
+                "batch_size": 1 if accurate else batch,
+                "sequential": accurate,
                 "language": None if lang in (None, "", "auto") else lang,
-                "vad_filter": bool(self.cfg.get("vad_filter", True)),
+                "vad_filter": bool(cfg.get("vad_filter", True)),
+                "hotwords": settings["hotwords"],
+                "beam_size": int(decode["beam_size"]),
+                "patience": float(decode["patience"]),
+                "condition_on_previous_text": bool(decode["condition_on_previous_text"]),
+                "repetition_penalty": float(decode["repetition_penalty"]),
+                "no_repeat_ngram_size": int(decode["no_repeat_ngram_size"]),
+                "prompt_reset_on_temperature": float(decode["prompt_reset_on_temperature"]),
+                "temperature_fallback": bool(decode["temperature_fallback"]),
+                "vad_min_silence_ms": int(decode["vad_min_silence_ms"]),
+                "vad_speech_pad_ms": int(decode["vad_speech_pad_ms"]),
             }
             words: list[Word] = []
-            info: dict = {"device": device, "compute_type": compute_type, "batch_size": batch}
+            info: dict = {"device": device, "compute_type": compute_type,
+                          "batch_size": job["batch_size"], "asr_mode": decode["asr_mode"],
+                          "model": model_name, "decode": dict(decode)}
             err: dict | None = None
             try:
                 for ev in self._run_worker(ASR_PYTHON, "sinribe.workers.asr_worker",
@@ -543,7 +697,11 @@ class Runner:
         t_start = time.time()
         out_dir = Path(self.spec.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        spans = stage_spans(with_fetch=bool(self.spec.url))
+        # With speaker separation off there is nothing to refine — no diarization means no voice
+        # prints to compare against — so the stage is dropped rather than run to a no-op, and
+        # the progress bar does not reserve a slice for work that will not happen.
+        refine = bool(self.cfg.get("refine_speakers", True)) and bool(self.cfg.get("diarize", True))
+        spans = stage_spans(with_fetch=bool(self.spec.url), with_refine=refine)
 
         if self.spec.url:
             self._stage("Downloading audio", *spans["fetch"])
@@ -552,6 +710,14 @@ class Runner:
             if not self.spec.input_path:
                 raise StageError("no input file or URL given")
             src = Path(self.spec.input_path)
+
+        model_name = presets.model_for(self.cfg)
+        if not model_available(model_name):
+            raise StageError(
+                f"the {model_name} model is not installed — open Setup and add the German "
+                f"models, or pick a different model. (It is converted on this machine from "
+                f"weights that faster-whisper cannot read directly, so a job cannot fetch it.)",
+                kind="setup")
 
         self._stage("Analysing", *spans["decode"])
         info = audio.probe(src)
@@ -578,6 +744,26 @@ class Runner:
         words, asr_info = self._transcribe(wav, info.duration, cache)
         self.log(f"transcription: {len(words)} words")
 
+        # A collapsed decode still exits 0 and still writes a tidy transcript, so nothing else in
+        # the pipeline notices. Measured once: large-v3-german with context conditioning returned
+        # 156 words for a 65-minute interview and reported success.
+        coverage = speech_coverage(words, diar_turns)
+        if coverage < 0.5:
+            self.log(f"WARNING: only {coverage:.0%} of the detected speech became words — "
+                     f"the transcript is probably truncated. Try a different quality setting "
+                     f"or model.")
+
+        scores: list[SentenceScore] = []
+        if refine:
+            self._check()
+            self._stage("Checking speakers", *spans["refine"])
+            scores = self._refine(wav, words, diar_turns, cache)
+            if scores:
+                decisive = sum(1 for s in scores
+                               if s.speaker and s.margin >= float(
+                                   self.cfg.get("refine_margin", 0.15)))
+                self.log(f"voice-print check: {decisive}/{len(scores)} sentences decisive")
+
         self._check()
         base, fin = spans["finish"]
         self._stage("Aligning speakers", base, fin * 0.2)
@@ -587,6 +773,10 @@ class Runner:
             max_turn_chars=int(self.cfg.get("max_turn_chars", 1200)),
             flicker_min_words=int(self.cfg.get("flicker_min_words", 3)),
             orphan_window_s=float(self.cfg.get("orphan_word_window_s", 2.0)),
+            sentence_atomic=bool(self.cfg.get("sentence_atomic", True)),
+            sentence_scores=scores or None,
+            refine_margin=float(self.cfg.get("refine_margin", 0.15)),
+            refine_min_seconds=float(self.cfg.get("refine_min_seconds", 0.8)),
         )
         self._frac(1.0)
         self.log(f"merged into {len(turns)} turns across {len(stats)} speaker(s)")
@@ -600,7 +790,8 @@ class Runner:
                 turns, info.duration,
                 url=str(self.cfg.get("llm_url")), model=str(self.cfg.get("llm_model")),
                 timeout=float(self.cfg.get("llm_timeout", 180)),
-                on_progress=self._frac, should_cancel=self.cancelled)
+                on_progress=self._frac, should_cancel=self.cancelled,
+                language=asr_info.get("language"))
             if not enrichment:
                 self.log("LLM enrichment unavailable or empty — writing transcript without it")
 
@@ -618,7 +809,10 @@ class Runner:
             "duration": info.duration,
             "language": asr_info.get("language"),
             "language_probability": asr_info.get("language_probability"),
-            "model": self.cfg.get("asr_model"),
+            "model": asr_info.get("model") or self.cfg.get("asr_model"),
+            "decode": asr_info.get("decode") or {},
+            "speed_target": self.cfg.get("speed_target"),
+            "speech_coverage": round(coverage, 4),
             "device": asr_info.get("device"),
             "compute_type": asr_info.get("compute_type"),
             "batch_size": asr_info.get("batch_size"),
@@ -632,7 +826,8 @@ class Runner:
         stem = safe_stem(meta.title) if meta else src.stem
         md_path = out_dir / f"{stem}.md"
         markdown.write(md_path, markdown.render(turns, stats, result,
-                                                title=result["title"], enrichment=enrichment))
+                                                title=result["title"], enrichment=enrichment,
+                                                review=bool(self.cfg.get("review_section", True))))
         written = [md_path]
 
         payload = sidecar.build(turns, stats, result, diar_turns=diar_turns,
@@ -661,6 +856,36 @@ class Runner:
             "written": [str(p) for p in written], "sidecar": payload,
         })
         return result
+
+
+def _span_seconds(spans: list[tuple[float, float]]) -> float:
+    """Total time covered by a set of possibly-overlapping intervals."""
+    total = 0.0
+    end = float("-inf")
+    for lo, hi in sorted(spans):
+        if hi <= end:
+            continue
+        total += hi - max(lo, end)
+        end = hi
+    return total
+
+
+def speech_coverage(words: list[Word], diar_turns: list[DiarTurn]) -> float:
+    """What fraction of the diarized speech ended up as words. 1.0 when there is nothing to say.
+
+    Diarization and transcription are independent views of the same audio, which makes this a
+    genuine cross-check rather than a self-report. A decode that collapses — and whisper does
+    collapse, silently and with a zero exit code — leaves the diarizer still insisting there are
+    sixty-five minutes of speech while the recogniser hands back twenty-six seconds of words.
+
+    Measured on the benchmark interview: healthy decodes score 1.00, the collapsed one 0.008. The
+    gap is enormous, so callers should treat this as a catastrophe detector and not read anything
+    into the difference between, say, 0.95 and 0.99.
+    """
+    speech = _span_seconds([(t.start, t.end) for t in diar_turns])
+    if speech <= 0:
+        return 1.0
+    return min(1.0, _span_seconds([(w.start, w.end) for w in words]) / speech)
 
 
 def purge_old_jobs(days: int = 14) -> int:
