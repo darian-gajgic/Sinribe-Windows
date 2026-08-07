@@ -233,6 +233,10 @@ DEFAULTS: dict = {
     # Append the list of passages the recogniser was least sure of. Cheap, and it turns
     # proofreading a transcript from "re-listen to all of it" into "check these forty spots".
     "review_section": True,
+    # How many of those passages to list. 0 means all of them, which is what makes the section a
+    # checklist rather than a sample — a hard 65-minute interview flags 363 and every one is a
+    # place worth an ear. Set a positive number to keep only that many least-confident entries.
+    "review_max_spans": 0,
     "write_json": True,
     "write_srt": True,
     "write_vtt": True,

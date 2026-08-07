@@ -9,6 +9,14 @@ The slow half of the ladder runs the audio through SEVERAL decodes and votes on 
 (`rover.py`). That is the only mechanism found that converts time into accuracy: 21.3 % for one
 pass, 20.4 % for three. Widening the beam instead does nothing at all.
 
+Voting stops paying after about the third pass and then very slowly gets worse — 20.5 % at five,
+20.6 % at seven and at nine — because every pass after the second model is a re-run of a model
+that has already voted, so it duplicates that model's errors rather than offsetting them, and
+duplicated errors win majorities. The ladder keeps the slow rungs, but the notes below say so
+plainly: past the recommended rung the extra time buys nothing. Measured 2026-08-07 by voting on
+the nine cached pass outputs of one 1x run, prefix by prefix, which is exactly what each rung
+would have decoded.
+
 Everything here is calibrated by `python -m sinribe.eval --sweep` against a human transcript of a
 deliberately hard recording. Two rules the calibration learned the hard way, both in HANDOFF.md:
 run nothing else on the GPU, and interleave the variants rather than running them in blocks. Error
@@ -189,20 +197,22 @@ RUNGS: list[Rung] = [
          extra_passes=(P_BATCHED, P_TURBO, P_TURBO_BATCHED, P_DENOISE),
          measured_rtf=5.4, measured_wer=0.205),
     Rung(target_rtf=2, model="large-v3",
-         note="Seven passes. NOT yet measured end to end — the vote had already stopped "
-              "improving at three passes, so this is here for you to test on your own "
-              "recordings, not because it is known to help.",
+         note="Seven passes. Measured WORSE than three, and takes four times as long: the "
+              "extra passes are re-filtered and re-beamed versions of a model that has already "
+              "voted, so they mostly repeat its mistakes and outvote the one pass that got it "
+              "right. There is no reason to pick this over the recommended setting.",
          decode={"beam_size": 5},
          extra_passes=(P_BATCHED, P_TURBO, P_TURBO_BATCHED, P_DENOISE, P_CLEAN, P_BEAM8),
-         measured_rtf=2.7),
+         measured_rtf=2.7, measured_wer=0.206),
     Rung(target_rtf=1, model="large-v3",
-         note="Nine passes including a very wide beam search. Slowest available and NOT "
-              "measured end to end. Everything known says it will not beat three passes; "
-              "run SinribeEval.bat on your own recording if you want to find out.",
+         note="Nine passes including a very wide beam search. Slowest available and measured "
+              "worse than three passes for ten times the wait — the beam-20 pass alone takes "
+              "longer than the entire recommended setting. Kept only so the ladder ends "
+              "somewhere; do not use it.",
          decode={"beam_size": 5},
          extra_passes=(P_BATCHED, P_TURBO, P_TURBO_BATCHED, P_DENOISE, P_CLEAN, P_BEAM8,
                        P_BEAM20, P_WIDE_VAD),
-         measured_rtf=1.6),
+         measured_rtf=2.1, measured_wer=0.206),
 ]
 
 MIN_TARGET = min(r.target_rtf for r in RUNGS)

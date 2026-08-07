@@ -8,7 +8,9 @@ This repository is the **Windows port** of `~/Sinribe` (Linux, private repo
 What changed is everything about how the program finds, installs and loads its dependencies —
 which on Windows is most of the work.
 
-**Last synced with the Linux tree 2026-08-07**, bringing across the whole accuracy effort: the
+**Last synced with the Linux tree 2026-08-07 (second sync the same day)**: the full voting ladder
+is now measured end to end, the review list is no longer capped, and the progress bar understands
+multi-pass decoding. The first sync that day brought across the whole accuracy effort: the
 quality slider (`presets.py`), multi-pass voting (`rover.py`), the voice-print speaker refiner
 (`workers/refine_worker.py`), the "Worth a listen" review section, the collapsed-decode guard, and
 the `sinribe.eval` scorer. The two repositories are forks, not branches, and neither has the other
@@ -20,7 +22,7 @@ exists in the other.
 | | Status |
 |---|---|
 | Ports cleanly, imports on a bare interpreter | ✅ |
-| 306 tests, ruff clean (`F,E,W,B`, 100 cols) | ✅ run on Linux |
+| 315 tests, ruff clean (`F,E,W,B`, 100 cols) | ✅ run on Linux |
 | Component detection, install planning, download-size estimates | ✅ unit-tested |
 | GPU → PyTorch build matrix | ✅ unit-tested against the published wheel index |
 | Both setup windows construct and drive headlessly | ✅ Qt offscreen + tkinter withdrawn |
@@ -180,6 +182,18 @@ What *does* convert compute into accuracy is **voting across several genuinely d
 (`rover.py`): 21.3 % for one pass, 20.4 % for three. The single biggest step is adding a different
 *model*, not re-chunking the same one. That is the whole design of the slow half of the slider.
 
+**And it stops there.** The whole ladder is measured: 1 → 21.3 %, 2 → 20.8 %, 3 → 20.5 %,
+4 → 20.3 %, 5 → 20.5 %, 6 → 20.6 %, 7 → 20.6 %, 8 → 20.7 %, 9 → 20.6 %. Everything past the ★ is
+flat or slightly worse, because passes five onward are re-filtered and re-beamed runs of a model
+that has already voted: they duplicate its errors instead of offsetting them, and duplicated
+errors win majorities. A 1× run costs 31 minutes against ~6 for the ★ rung and lands 0.2 points
+worse, with the beam-20 pass alone taking 10 of those 31 minutes. The bottom two rungs carry that
+in their `note` text now — do not quietly re-sell them as "more accurate".
+
+**Cheap way to re-measure the whole ladder**, worth knowing before anyone books a GPU afternoon:
+one 1× run leaves `asr-pass0..8.json` in the job cache, and `rover.combine(passes[:n])` on each
+prefix *is* rung n. All nine points score in seconds, on the CPU, with no decoding at all.
+
 The floor is **8.7 % of words that no configuration tried gets right**. Accept it and spend the
 effort on the review workflow instead — `SinribeEval.bat --ceiling` re-derives that number.
 
@@ -191,6 +205,16 @@ is fine, so this is that fine-tune having lost the ability to condition on a pro
 conversion fault. `config.MODELS_WITHOUT_HOTWORDS` records it: the pipeline drops the hotwords and
 logs loudly rather than failing the job, and the interface disables the field when that model is
 selected. If a future model shows the same behaviour, add it to that set.
+
+### The review list is deliberately uncapped
+
+`render/markdown.review_spans()` used to keep only the 60 least confident passages. On the
+recording it was built for that silently withheld 303 of 363 — a checklist that stops at a fifth
+of the way through is worse than a long one, and the section exists to be worked through, not
+skimmed. The default is now every passage, in time order. `config.review_max_spans` takes a
+positive number for anyone who wants a sample instead; the cap still keeps the *least confident*
+entries and only then restores time order, because truncating in time order would hand back a
+list covering only the first ten minutes.
 
 ### Whisper can collapse silently — there is a guard
 
@@ -262,6 +286,13 @@ Beyond the platform layer, deliberately:
   21.6 % WER at 50×, sequential 21.3 % at 13×. One thing that turned out **not** to be true:
   batching was assumed to loosen word timestamps enough to hurt attribution. It does not — 99.0 %
   batched against 98.9 % sequential. Don't avoid batching for that reason.
+- **The progress bar has to know about voting.** A slow rung decodes the file up to nine times and
+  each decode reports its own 0..1, so without `Runner._subspan` the bar filled and snapped back
+  to the start nine times while the ETA promised the job was nearly over once per pass. Each pass
+  gets a slice of the stage weighted by `_pass_cost`, because the passes are wildly unequal — a
+  batched turbo decode against a beam-20 one is a couple of minutes against ten. The ETA is
+  computed from progress through the whole *stage* (`_stage_base`/`_stage_weight`), not through
+  the current subspan, so it counts down once. `TestVotingProgress` guards all of this.
 - pyannote 4 returns a `DiarizeOutput`, not an `Annotation`. Use
   `.exclusive_speaker_diarization` — no overlapping turns, built for exactly this case.
 
@@ -295,7 +326,7 @@ Beyond the platform layer, deliberately:
 The package imports and the whole suite runs here; only the app itself needs Windows.
 
 ```bash
-python3 -m pytest tests/ -q                                    # 306 tests, no GPU, no network
+python3 -m pytest tests/ -q                                    # 315 tests, no GPU, no network
 python3 -m ruff check sinribe/ tests/ tools/ --select F,E,W,B --line-length 100
 python3 -m sinribe.setup_core --check                          # detection against this machine
 python3 tools/make_icon.py                                     # regenerate the icon

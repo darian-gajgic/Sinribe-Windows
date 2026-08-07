@@ -406,3 +406,77 @@ class TestConfigMigration:
         cfg = self._load(tmp_path, monkeypatch, {"nonsense": 1, "asr_mode": "accurate"})
         assert "nonsense" not in cfg
         assert "asr_mode" not in cfg
+
+
+class TestVotingProgress:
+    """A voting rung runs the same decode up to nine times, and each one reports its own 0..1.
+
+    Before `_subspan` those went straight to the bar, so on the 1x rung it filled and snapped
+    back to the start nine times while the ETA promised the job was nearly over once per pass.
+    """
+
+    def _runner(self):
+        r = Runner.__new__(Runner)
+        seen: list[tuple[float, str, str]] = []
+        r._on_progress = lambda f, p, d: seen.append((f, p, d))
+        r._on_log = lambda m: None
+        r._base = r._weight = r._stage_base = r._stage_weight = 0.0
+        r._phase, r._t_phase = "", 0.0
+        return r, seen
+
+    def test_a_nine_pass_decode_never_moves_the_bar_backwards(self):
+        r, seen = self._runner()
+        r._stage("Transcribing", 0.3, 0.6)
+        costs = [1.0, 0.4, 0.4, 0.16, 1.0, 1.0, 1.6, 4.0, 1.0]
+        for i in range(len(costs)):
+            with r._subspan(i, costs):
+                for f in (0.0, 0.25, 0.5, 1.0):
+                    r._frac(f)
+        vals = [f for f, _, _ in seen]
+        # Tolerance because consecutive passes meet at a boundary both of them compute, and the
+        # two roundings can differ in the last bit. The bar is a permille integer; this is noise.
+        assert all(b >= a - 1e-9 for a, b in zip(vals, vals[1:], strict=False))
+        assert vals[0] == pytest.approx(0.3)
+        assert vals[-1] == pytest.approx(0.9)
+
+    def test_a_pass_gets_a_share_of_the_stage_proportional_to_its_cost(self):
+        r, seen = self._runner()
+        r._stage("Transcribing", 0.0, 1.0)
+        costs = [1.0, 3.0]
+        for i in range(2):
+            with r._subspan(i, costs):
+                r._frac(1.0)
+        assert [f for f, _, _ in seen][1:] == pytest.approx([0.25, 1.0])
+
+    def test_the_stage_span_is_restored_after_a_subspan(self):
+        r, _ = self._runner()
+        r._stage("Transcribing", 0.3, 0.6)
+        with r._subspan(1, [1.0, 1.0]):
+            pass
+        assert (r._base, r._weight) == (0.3, 0.6)
+
+    def test_the_estimate_counts_down_once_not_once_per_pass(self, monkeypatch):
+        # Ten seconds in, one of four equal passes done: a quarter of the stage, so ~30s left.
+        # The pre-fix code saw "pass 1 is 100% done" and said the stage was finished.
+        r, seen = self._runner()
+        r._stage("Transcribing", 0.0, 1.0)
+        r._t_phase = time.time() - 10.0
+        with r._subspan(0, [1.0] * 4):
+            r._frac(1.0)
+        assert "30s left" in seen[-1][2]
+
+
+class TestPassCost:
+    def test_cheap_decodes_are_ranked_below_the_baseline(self):
+        from sinribe.pipeline import _pass_cost
+        base = _pass_cost({"asr_mode": "accurate", "beam_size": 5}, "large-v3")
+        batched = _pass_cost({"asr_mode": "fast", "beam_size": 5}, "large-v3")
+        turbo = _pass_cost({"asr_mode": "accurate", "beam_size": 5}, "large-v3-turbo-german")
+        wide = _pass_cost({"asr_mode": "accurate", "beam_size": 20}, "large-v3")
+        assert batched < base and turbo < base and wide > base
+
+    def test_a_cost_is_never_zero(self):
+        from sinribe.pipeline import _pass_cost
+        # A zero would make one pass invisible on the bar and, with every pass at zero, divide
+        # the stage by nothing at all.
+        assert _pass_cost({"asr_mode": "fast", "beam_size": 0}, "large-v3-turbo-german") > 0

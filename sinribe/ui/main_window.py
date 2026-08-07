@@ -389,9 +389,9 @@ class MainWindow(QWidget):
         self.cb_review.setToolTip(
             "Append the passages the recogniser was least sure of, with timestamps.\n"
             "Measured on a hard interview, 57% of the words it flags are genuinely wrong —\n"
-            "so this is a short list worth checking by ear instead of re-listening to the\n"
-            "whole recording. On a difficult file it shows the 60 least confident passages\n"
-            "and says how many more there were.")
+            "so this is the list to check by ear instead of re-listening to the whole\n"
+            "recording. Every flagged passage is listed, in time order; a hard 65-minute\n"
+            "interview produces a few hundred.")
         for w in (self.cb_json, self.cb_srt, self.cb_vtt, self.cb_llm, self.cb_review):
             checks.addWidget(w)
         checks.addStretch(1)
@@ -858,7 +858,8 @@ class MainWindow(QWidget):
                        markdown.render(turns, stats, self._result,
                                        title=self._result.get("title"),
                                        enrichment=self._result.get("enrichment"),
-                                       review=bool(self.cfg.get("review_section", True))))
+                                       review=bool(self.cfg.get("review_section", True)),
+                                       review_max=int(self.cfg.get("review_max_spans", 0))))
         if self.cfg.get("write_json", True):
             payload = sidecar.build(turns, stats, self._result,
                                     enrichment=self._result.get("enrichment"),

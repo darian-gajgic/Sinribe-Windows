@@ -40,7 +40,7 @@ def review_spans(
     turns: list[Turn],
     threshold: float = 0.5,
     context: int = 4,
-    max_spans: int = 60,
+    max_spans: int = 0,
 ) -> list[tuple[float, str, str]]:
     """Passages the recogniser was unsure of, as (start, speaker, quoted text with context).
 
@@ -52,8 +52,12 @@ def review_spans(
     Runs are merged across a couple of confident words so that "…, [gap], …" reads as one
     passage rather than three, which is how someone correcting a transcript would hear it.
 
-    When there are more candidates than `max_spans` — and on a difficult recording there are many
-    more; that interview produced 385 — the list keeps the LEAST confident ones, then restores
+    `max_spans` 0 means no limit, which is the default: the list is a proofreading checklist, and
+    a checklist that silently stops two thirds of the way through is worse than a long one. The
+    benchmark interview produces 363 entries over 65 minutes — long, but it is the complete set
+    of places worth an ear, and working through it beats re-listening to the whole recording.
+
+    A positive `max_spans` caps the list, keeping the LEAST confident entries and then restoring
     time order for reading. Truncating in time order instead would quietly hand back a review list
     covering only the first ten minutes.
     """
@@ -88,14 +92,14 @@ def review_spans(
             i = end + 1
 
     scored.sort(key=lambda s: s[0])          # least confident first
-    keep = scored[:max_spans]
+    keep = scored[:max_spans] if max_spans > 0 else scored
     keep.sort(key=lambda s: s[1])            # ... then back into reading order
     return [(start, speaker, text) for _, start, speaker, text in keep]
 
 
 def count_review_spans(turns: list[Turn], threshold: float = 0.5) -> int:
     """How many passages fall below `threshold` in total, before any cap is applied."""
-    return len(review_spans(turns, threshold=threshold, max_spans=1 << 30))
+    return len(review_spans(turns, threshold=threshold, max_spans=0))
 
 
 def render(
@@ -105,12 +109,14 @@ def render(
     title: str | None = None,
     enrichment: dict | None = None,
     review: bool = False,
+    review_max: int = 0,
 ) -> str:
     """Build the full Markdown document.
 
     `result` carries job metadata (source path, duration, model, device, timings).
     `enrichment` is the optional LLM output: {"summary": str, "chapters": [{"start", "title"}]}.
-    `review` appends the list of passages worth checking by ear (see review_spans).
+    `review` appends the list of passages worth checking by ear (see review_spans);
+    `review_max` caps that list, 0 meaning all of them.
     """
     raw_source = str(result.get("source", "") or "")
     # A downloaded episode's source is a URL. It must NOT go through Path(), which silently
@@ -146,6 +152,12 @@ def render(
     # afterwards, which otherwise means remembering where the slider was.
     if result.get("speed_target"):
         model_line += f" · **Quality** {result['speed_target']}× target"
+    # The pass count is the part of the quality setting that actually cost the time, so it is
+    # worth naming separately rather than leaving it implied by the rung.
+    if int(result.get("passes") or 1) > 1:
+        model_line += f" · **Voted** {result['passes']} passes"
+        if result.get("vote_agreement") is not None:
+            model_line += f" ({float(result['vote_agreement']):.0%} unanimous)"
     lines.append(model_line)
     uploader = str(result.get("uploader") or "")
     if source_is_url:
@@ -224,7 +236,7 @@ def render(
 
     # --- optional review list -------------------------------------------------------
     if review and turns:
-        spans = review_spans(turns)
+        spans = review_spans(turns, max_spans=review_max)
         if spans:
             total = count_review_spans(turns)
             lines.append("---")
@@ -237,6 +249,9 @@ def render(
             if total > len(spans):
                 intro += (f" Showing the {len(spans)} least confident of {total} — a recording "
                           f"this difficult has more doubt in it than one sitting can cover.")
+            else:
+                intro += (f" All {total} of them are here, in time order, so this doubles as a "
+                          f"checklist to work through against the audio.")
             lines.append(intro)
             lines.append("")
             for start, speaker, text in spans:

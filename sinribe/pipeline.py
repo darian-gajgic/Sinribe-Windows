@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 import datetime as _dt
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -44,6 +45,24 @@ STAGE_SHARES = {
     "refine": 0.03,
     "finish": 0.06,
 }
+
+
+def _pass_cost(decode: dict, model: str) -> float:
+    """Roughly how long one voting pass takes, relative to a sequential large-v3 decode.
+
+    Only the ratios matter — they set each pass's share of the progress bar. Calibrated against
+    the nine-pass run of 2026-08-07, where the passes took between one and ten minutes each:
+    batched and turbo are the cheap ones, a widened beam is far and away the expensive one.
+    """
+    cost = 1.0
+    if "turbo" in model:
+        cost *= 0.4                                  # four decoder layers instead of thirty-two
+    if str(decode.get("asr_mode")) == "fast":
+        cost *= 0.4                                  # batched: measured 2.5x faster
+    beam = float(decode.get("beam_size") or 5)
+    if beam > 5:
+        cost *= beam / 5                             # beam 20 measured ~3.3x a beam-5 decode
+    return max(cost, 0.05)
 
 
 def stage_spans(with_fetch: bool, with_refine: bool = True) -> dict[str, tuple[float, float]]:
@@ -248,6 +267,8 @@ class Runner:
         self._proc: subprocess.Popen | None = None
         self._base = 0.0
         self._weight = 0.0
+        self._stage_base = 0.0
+        self._stage_weight = 0.0
         self._phase = ""
         self._t_phase = 0.0
         self._meta: fetch.MediaMeta | None = None
@@ -272,17 +293,43 @@ class Runner:
 
     def _stage(self, phase: str, base: float, weight: float) -> None:
         self._phase, self._base, self._weight = phase, base, weight
+        # The stage's own span, kept apart from _base/_weight because `_subspan` narrows those.
+        self._stage_base, self._stage_weight = base, weight
         self._t_phase = time.time()
         self._on_progress(base, phase, "")
 
+    @contextmanager
+    def _subspan(self, index: int, weights: list[float]) -> Iterator[None]:
+        """Confine progress reports to slice `index` of the current stage.
+
+        Voting runs the same decode up to nine times, and each of those reports its own 0..1.
+        Without this the bar would fill and snap back to the start once per pass, and the ETA —
+        elapsed time divided by the fraction done — would promise the job was nearly over every
+        time a pass ended. `weights` gives each pass its share of the stage, because the passes
+        are not the same size: a batched decode is a couple of minutes where beam 20 is ten.
+        """
+        total = sum(weights) or 1.0
+        base, weight = self._base, self._weight
+        self._base = base + weight * (sum(weights[:index]) / total)
+        self._weight = weight * (weights[index] / total)
+        try:
+            yield
+        finally:
+            self._base, self._weight = base, weight
+
     def _frac(self, f: float, detail: str = "") -> None:
         f = max(0.0, min(1.0, f))
-        if not detail and f > 0.02:
-            elapsed = time.time() - self._t_phase
-            if elapsed > 5:
-                remain = elapsed * (1 - f) / f
-                detail = f"~{human_duration(remain)} left"
-        self._on_progress(self._base + self._weight * f, self._phase, detail)
+        here = self._base + self._weight * f
+        if not detail:
+            # Estimate from progress through the whole STAGE, not through the current subspan,
+            # so a nine-pass decode counts down once rather than nine times.
+            done = ((here - self._stage_base) / self._stage_weight) if self._stage_weight else f
+            if done > 0.02:
+                elapsed = time.time() - self._t_phase
+                if elapsed > 5:
+                    remain = elapsed * (1 - done) / done
+                    detail = f"~{human_duration(remain)} left"
+        self._on_progress(here, self._phase, detail)
 
     # -- subprocess driver -----------------------------------------------------------
     def _run_worker(self, python: Path, module: str, job: dict, env: dict) -> Iterator[dict]:
@@ -522,19 +569,32 @@ class Runner:
         passes: list[list[Word]] = []
         info: dict = {}
         base_overrides = dict(self.cfg.get("decode_overrides") or {})
-        for i, override in enumerate([{}] + extra):
-            self._check()
+        plans = []
+        for override in [{}] + extra:
             job_cfg = dict(self.cfg)
             job_cfg["decode_overrides"] = {**base_overrides, **override}
+            plans.append(job_cfg)
+        # Give the bar each pass's real share up front, so it advances evenly instead of racing
+        # through the batched passes and then appearing to hang for ten minutes on beam 20.
+        costs = [_pass_cost(presets.decode_settings(c), presets.model_for(c)) for c in plans]
+
+        for i, job_cfg in enumerate(plans):
+            self._check()
             # A pass may name a model the user never installed. Skipping it costs a little
             # accuracy; failing the whole job over an optional extra decode would be absurd.
             if not model_available(presets.model_for(job_cfg)):
                 self.log(f"pass {i + 1} skipped — {presets.model_for(job_cfg)} is not installed "
                          f"(open Setup and add the German models for the full quality range)")
                 continue
-            words, pass_info = self._transcribe_once(
-                wav, duration, cache, cfg=job_cfg, tag=f"pass{i}")
-            self.log(f"pass {i + 1}/{len(extra) + 1}: {len(words)} words")
+            with self._subspan(i, costs):
+                # Naming the pass in the phase label is what tells the user that a bar which has
+                # been moving for twenty minutes is working, not stuck.
+                self._phase = (f"Transcribing · pass {i + 1}/{len(plans)}"
+                               if len(plans) > 1 else "Transcribing")
+                self._frac(0.0)
+                words, pass_info = self._transcribe_once(
+                    wav, duration, cache, cfg=job_cfg, tag=f"pass{i}")
+            self.log(f"pass {i + 1}/{len(plans)}: {len(words)} words")
             passes.append(words)
             if not info:
                 info = pass_info
@@ -813,6 +873,11 @@ class Runner:
             "decode": asr_info.get("decode") or {},
             "speed_target": self.cfg.get("speed_target"),
             "speech_coverage": round(coverage, 4),
+            # How many decodes were voted on, and how much they agreed. Without these two a
+            # nine-pass transcript is indistinguishable from a one-pass one after the fact,
+            # which makes "was the slow setting worth it?" unanswerable from the output alone.
+            "passes": asr_info.get("passes", 1),
+            "vote_agreement": asr_info.get("vote_agreement"),
             "device": asr_info.get("device"),
             "compute_type": asr_info.get("compute_type"),
             "batch_size": asr_info.get("batch_size"),
@@ -827,7 +892,9 @@ class Runner:
         md_path = out_dir / f"{stem}.md"
         markdown.write(md_path, markdown.render(turns, stats, result,
                                                 title=result["title"], enrichment=enrichment,
-                                                review=bool(self.cfg.get("review_section", True))))
+                                                review=bool(self.cfg.get("review_section", True)),
+                                                review_max=int(
+                                                    self.cfg.get("review_max_spans", 0))))
         written = [md_path]
 
         payload = sidecar.build(turns, stats, result, diar_turns=diar_turns,

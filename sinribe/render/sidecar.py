@@ -31,7 +31,8 @@ def build(
         "meta": {k: result.get(k) for k in (
             "source", "duration", "language", "language_probability", "model", "device",
             "compute_type", "batch_size", "diar_pipeline", "elapsed", "finished_at",
-            "realtime_factor", "title", "speed_target", "decode", "speech_coverage")},
+            "realtime_factor", "title", "speed_target", "decode", "speech_coverage",
+            "passes", "vote_agreement")},
         "stats": {k: {kk: vv for kk, vv in v.items() if kk != "longest"} | {
             "longest": list(v["longest"])} for k, v in stats.items()},
         "speaker_names": {t.speaker: t.speaker for t in turns},

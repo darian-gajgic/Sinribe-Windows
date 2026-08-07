@@ -176,8 +176,8 @@ class TestReviewSpans:
         assert markdown.count_review_spans(turns) == 40
 
     def test_section_says_when_it_is_showing_a_subset(self):
-        turns = [self._turn([0.2, 0.9, 0.9, 0.9, 0.9] * 80)]   # 80 spans, default cap is 60
-        md = markdown.render(turns, {}, RESULT, review=True)
+        turns = [self._turn([0.2, 0.9, 0.9, 0.9, 0.9] * 80)]
+        md = markdown.render(turns, {}, RESULT, review=True, review_max=60)
         assert "of 80" in md
 
     def test_section_stays_quiet_when_nothing_was_dropped(self):
@@ -185,6 +185,19 @@ class TestReviewSpans:
         md = markdown.render(turns, {}, RESULT, review=True)
         assert "## Worth a listen" in md
         assert "Showing the" not in md
+
+    def test_nothing_is_dropped_by_default(self):
+        # The section is a proofreading checklist. It used to stop at 60, so on the recording it
+        # was built for it silently withheld 303 of the 363 places worth an ear.
+        turns = [self._turn([0.2, 0.9, 0.9, 0.9, 0.9] * 80)]
+        assert len(markdown.review_spans(turns)) == 80
+        md = markdown.render(turns, {}, RESULT, review=True)
+        assert "Showing the" not in md
+        assert "All 80 of them are here" in md
+
+    def test_a_cap_of_zero_means_everything(self):
+        turns = [self._turn([0.2, 0.9, 0.9, 0.9, 0.9] * 40)]
+        assert len(markdown.review_spans(turns, max_spans=0)) == 40
 
     def test_spans_are_sorted_by_time(self):
         turns = [self._turn([0.2, 0.9], start=50.0), self._turn([0.2, 0.9], start=10.0)]

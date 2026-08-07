@@ -115,6 +115,11 @@ passages the recogniser was least sure of, with timestamps and the doubtful word
 Fifty-seven percent of the words it flags are genuinely wrong, so on a difficult recording this is
 where an hour of checking gets you the most back — considerably more than any decode setting will.
 
+**Every flagged passage is listed**, in time order, so the section is a checklist rather than a
+sample: a hard 65-minute interview produces a few hundred entries and each one is a place worth an
+ear. If you would rather have a short sample, set `review_max_spans` in the config to the number
+you want and it keeps that many least-confident entries.
+
 ### From the command line
 
 ```bat
@@ -164,9 +169,9 @@ this file"* rather than *"high quality"*.
 | 20× | 1 | 20× | 21.3 % | `large-v3`, one pass in order |
 | 14× | 2 | 15× | 20.8 % | + a batched pass, voted |
 | **10× ★** | 3 | 11× | **20.4 %** | + a second *model*, voted |
-| 5× | 5 | 5.4× | 20.1 % | five passes, two models |
-| 2× | 7 | 2.7× | 20.1 % | seven passes |
-| 1× | 9 | 1.6× | 20.1 % | nine passes, incl. a very wide beam |
+| 5× | 5 | 5.4× | 20.5 % | five passes, two models |
+| 2× | 7 | 2.7× | 20.6 % | seven passes — *worse than ★, four times the wait* |
+| 1× | 9 | 2.1× | 20.6 % | nine passes — *worse than ★, ten times the wait* |
 
 **Read the speeds as estimates, not promises.** They were measured on the Linux original, on one
 RTX 5070 Ti, and have never been timed on Windows. The error rates carry over — same weights, same
@@ -193,9 +198,16 @@ rescues an answer the model already had; here the model's probabilities are them
 whether it heard *das* or *es*, and searching a wrong distribution harder returns the same wrong
 answer at five times the price.
 
-Returns flatten at five passes and turn back up past nine, as weaker decodes start outvoting
-better ones. The slowest positions are kept so you can confirm that on your own recordings; the
-★ sits where the curve bends.
+**It stops paying after three passes, and the whole ladder has now been measured to prove it:**
+1 → 21.3 %, 2 → 20.8 %, 3 → 20.5 %, 4 → 20.3 %, 5 → 20.5 %, 6 → 20.6 %, 7 → 20.6 %, 8 → 20.7 %,
+9 → 20.6 %. Everything past the ★ is flat or slightly worse, because passes five onward are
+re-filtered and re-beamed runs of a model that has *already* voted — they repeat its mistakes
+rather than offsetting them, and duplicated mistakes win majorities.
+
+The cost is not flat, though. A 1× run takes **31 minutes against about 6 for the ★ setting** and
+lands 0.2 points worse; the beam-20 pass alone accounts for 10 of those 31 minutes. The slow
+positions are kept so the ladder ends somewhere and so you can check the claim on your own
+recordings. They are not a better setting.
 
 ### Names & terms — worth trying, not a cure
 
@@ -290,6 +302,11 @@ program is holding the card (a game, a local LLM), a banner in the window says s
 ---
 
 ## Practical notes
+
+**The progress bar knows about voting.** A slow quality setting decodes the file up to nine times,
+so the bar reports "Transcribing · pass 3/9" and each pass gets a share of the stage sized to how
+long it actually takes — a batched pass is a fraction of a beam-20 one. The time estimate counts
+down once across the whole stage rather than restarting at every pass.
 
 **Interruptions are cheap.** Each stage checkpoints into `%LOCALAPPDATA%\Sinribe\jobs`. Cancel a
 three-hour job at 80% and start it again later: it resumes rather than restarts. Downloads
